@@ -25,9 +25,26 @@ async function auth(body, {checkBan=true}={}) {
   return u;
 }
 function deviceHash(v){const s=String(v||'').trim();if(!s||s.length>256)throw Object.assign(new Error('端末識別子が必要です'),{status:400});return s}
-export default async function handler(req,res){
-  res.setHeader('Cache-Control','no-store'); res.setHeader('X-Content-Type-Options','nosniff');
-  if(req.method!=='POST')return res.status(405).json({ok:false,error:'POST only'});
+
+export default async function handler(req, res) {
+  // CORS: すべてのオリジンを許可
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, apikey, Prefer'
+  );
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  // プリフライトリクエストに応答
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok: false, error: 'POST only' });
+  }
   try {
     const b=req.body||{}, action=String(b.action||'');
     if(!action)throw Object.assign(new Error('action が必要です'),{status:400});
