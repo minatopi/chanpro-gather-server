@@ -25,9 +25,18 @@ async function auth(body, {checkBan=true}={}) {
   return u;
 }
 function deviceHash(v){const s=String(v||'').trim();if(!s||s.length>256)throw Object.assign(new Error('端末識別子が必要です'),{status:400});return s}
-
-export default async function handler(req, res) {
-　res.setHeader('Access-Control-Allow-Origin', '*');
+export default async function handler(req,res){
+  // CORS: allow requests from any website. This API does not rely on browser cookies;
+  // every state-changing action still validates the username/password in the request body.
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, apikey, x-client-info, Prefer, Accept, Accept-Profile, Content-Profile');
+  res.setHeader('Access-Control-Max-Age','86400');
+  res.setHeader('Vary','Origin');
+  res.setHeader('Cache-Control','no-store'); res.setHeader('X-Content-Type-Options','nosniff');
+  // Browser preflight must return 2xx before the actual POST is sent.
+  if(req.method==='OPTIONS')return res.status(200).end();
+  if(req.method!=='POST')return res.status(405).json({ok:false,error:'POST only'});
   try {
     const b=req.body||{}, action=String(b.action||'');
     if(!action)throw Object.assign(new Error('action が必要です'),{status:400});
