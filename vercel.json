@@ -1,9 +1,7 @@
 {
-  "version": 2,
-  "rewrites": [
-    {
-      "source": "/api/gather",
-      "destination": "/api/gather"
+  "functions": {
+    "api/secure.js": {
+      "maxDuration": 10
     }
-  ]
+  }
 }
