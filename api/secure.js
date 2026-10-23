@@ -17,6 +17,47 @@ function safeEqual(a, b) {
   const bb = Buffer.from(String(b || ""));
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
+// Short-lived stateless session token: avoids querying users/password_hash on every API call.
+// Keep the signing secret in Vercel Environment Variables, never in browser code.
+const SESSION_TTL_SECONDS = 60 * 60;
+function sessionSecret() {
+  const secret = process.env.CHANPRO_SESSION_SECRET || SUPABASE_SERVICE_ROLE_KEY;
+  if (!secret || String(secret).length < 32) throw new Error("CHANPRO_SESSION_SECRETまたはSUPABASE_SERVICE_ROLE_KEYが必要です");
+  return String(secret);
+}
+function signSession(user) {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = Buffer.from(JSON.stringify({
+    sub: String(user.id),
+    username: String(user.username),
+    role: String(user.role || "user"),
+    iat: now,
+    exp: now + SESSION_TTL_SECONDS,
+    user
+  })).toString("base64url");
+  const signature = crypto.createHmac("sha256", sessionSecret()).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+function verifySession(token) {
+  if (!token || typeof token !== "string" || token.length > 20000) {
+    throw Object.assign(new Error("セッションキーがありません。再ログインしてください"), { status: 401 });
+  }
+  const parts = token.split(".");
+  if (parts.length !== 2) throw Object.assign(new Error("セッションキーが不正です。再ログインしてください"), { status: 401 });
+  const expected = crypto.createHmac("sha256", sessionSecret()).update(parts[0]).digest("base64url");
+  if (!safeEqual(parts[1], expected)) throw Object.assign(new Error("セッションキーが不正です。再ログインしてください"), { status: 401 });
+  let data;
+  try { data = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")); }
+  catch { throw Object.assign(new Error("セッションキーが不正です。再ログインしてください"), { status: 401 }); }
+  if (!data?.user?.id || !data?.exp || data.exp <= Math.floor(Date.now() / 1000)) {
+    throw Object.assign(new Error("セッションキーの有効期限が切れました。再ログインしてください"), { status: 401 });
+  }
+  return data.user;
+}
+function bearerToken(req, body) {
+  const header = String(req.headers?.authorization || req.headers?.Authorization || "");
+  return header.match(/^Bearer\s+(.+)$/i)?.[1] || body.token || "";
+}
 function client(req) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) throw new Error("Vercel環境変数が設定されていません");
   return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -86,7 +127,7 @@ module.exports = async (req, res) => {
           user_id: data.id, device_hash: body.deviceHash,
           device_info: body.deviceInfo || {}, last_login_at: new Date().toISOString()
         }, { onConflict: "user_id,device_hash" });
-        return json(res, 200, { ok: true, user: data });
+        return json(res, 200, { ok: true, user: data, token: signSession(data), expiresIn: SESSION_TTL_SECONDS });
       }
       const { user } = await authenticate(db, body);
       if (body.deviceHash) {
@@ -97,10 +138,11 @@ module.exports = async (req, res) => {
         if (error) throw error;
       }
       delete user.password_hash;
-      return json(res, 200, { ok: true, user, isAdmin: ["admin", "developer"].includes(user.role) });
+      return json(res, 200, { ok: true, user, isAdmin: ["admin", "developer"].includes(user.role), token: signSession(user), expiresIn: SESSION_TTL_SECONDS });
     }
 
-    const { user } = await authenticate(db, body);
+    // All non-login requests use the signed 1-hour session token; do not send/check passwords again.
+    const user = verifySession(bearerToken(req, body));
     const admin = ["admin", "developer"].includes(user.role);
     const payload = body.payload || {};
     switch (action) {
@@ -299,7 +341,8 @@ module.exports = async (req, res) => {
         return json(res, 400, { error: "未対応のAPI操作です", action });
     }
   } catch (error) {
-    console.error("secure API error:", error.message || error);
+    // Avoid high-volume log ingestion; return errors to the caller without logging every expected 4xx.
+    if (!error.status || error.status >= 500) console.error("secure API server error");
     return json(res, error.status || 500, { error: error.message || "サーバー処理に失敗しました" });
   }
 };
