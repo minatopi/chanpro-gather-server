@@ -4,6 +4,81 @@ const crypto = require("node:crypto");
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+const IP_HASH_SECRET = process.env.IP_HASH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const POSTHOG_PROJECT_KEY = process.env.POSTHOG_PROJECT_KEY || "";
+const SESSION_SECRET = process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const POSTHOG_API_HOST = (process.env.POSTHOG_API_HOST || "https://us.i.posthog.com").replace(/\/$/, "");
+const IP_RATE_LIMIT = Math.max(20, Number(process.env.IP_RATE_LIMIT || 120));
+const IP_RATE_WINDOW_SECONDS = Math.max(60, Number(process.env.IP_RATE_WINDOW_SECONDS || 300));
+const IP_BLOCK_SECONDS = Math.max(60, Number(process.env.IP_BLOCK_SECONDS || 3600));
+
+function getClientIp(req) {
+  // Vercel が付与する接続元IPを優先。クライアントのJSON本文からIPを受け取らない。
+  const real = req.headers["x-real-ip"];
+  const forwarded = req.headers["x-forwarded-for"];
+  const raw = (Array.isArray(real) ? real[0] : real) ||
+    (Array.isArray(forwarded) ? forwarded[0] : String(forwarded || "").split(",")[0]);
+  const ip = String(raw || "").trim().replace(/^\[|\]$/g, "");
+  if (!ip || ip.length > 100 || !/^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(ip)) {
+    throw Object.assign(new Error("接続元IPを確認できません。Vercelのx-real-ip設定を確認してください"), { status: 503 });
+  }
+  return ip;
+}
+function hashIp(ip) {
+  if (!IP_HASH_SECRET) throw Object.assign(new Error("IP_HASH_SECRET が未設定です"), { status: 503 });
+  return sha256(IP_HASH_SECRET + ":" + String(ip).trim().toLowerCase());
+}
+async function sendPostHogSecurityEvent(event, ip, props = {}) {
+  if (!POSTHOG_PROJECT_KEY || typeof fetch !== "function") return;
+  try {
+    await fetch(POSTHOG_API_HOST + "/capture/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: POSTHOG_PROJECT_KEY,
+        event,
+        distinct_id: "chanpro-server-security",
+        properties: {
+          $ip: ip,
+          $process_person_profile: false,
+          event_source: "chanpro-vercel-secure",
+          ...props
+        }
+      }),
+      signal: AbortSignal.timeout(2500)
+    });
+  } catch (e) {
+    // Analytics outage must not disable authentication or rate limiting.
+    console.warn("PostHog security event could not be sent:", e?.message || e);
+  }
+}
+async function checkIpBan(db, ipHash, ip, action) {
+  const { data, error } = await db.from("banned_ip_addresses")
+    .select("reason,expires_at").eq("ip_hash", ipHash).maybeSingle();
+  if (error) throw error;
+  if (data && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now())) {
+    await sendPostHogSecurityEvent("chanpro_ip_banned_request", ip, { ip_hash: ipHash, action, reason: data.reason || "IP BAN" });
+    throw Object.assign(new Error(data.reason || "このIPアドレスからのアクセスは禁止されています"), { status: 403 });
+  }
+}
+
+async function enforceIpRateLimit(db, ipHash) {
+  const { data, error } = await db.rpc("guard_ip_request", {
+    p_ip_hash: ipHash,
+    p_limit: IP_RATE_LIMIT,
+    p_window_seconds: IP_RATE_WINDOW_SECONDS,
+    p_block_seconds: IP_BLOCK_SECONDS
+  });
+  if (error) {
+    console.error("IP rate-limit RPC failed:", error.message || error);
+    throw Object.assign(new Error("IP制限の確認に失敗しました。SupabaseのセキュリティSQLを適用してください"), { status: 503 });
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  if (row?.blocked) {
+    throw Object.assign(new Error(`アクセスが集中したため、このIPからのAPIアクセスを一時停止しています。約${Math.max(1, Math.ceil(Number(row.retry_after_seconds || 3600) / 60))}分後に再試行してください`), { status: 429, retryAfter: Number(row.retry_after_seconds || 3600), ipBlocked: true });
+  }
+}
+
 function json(res, status, body) {
   res.status(status).setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
@@ -17,46 +92,45 @@ function safeEqual(a, b) {
   const bb = Buffer.from(String(b || ""));
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
-// Short-lived stateless session token: avoids querying users/password_hash on every API call.
-// Keep the signing secret in Vercel Environment Variables, never in browser code.
-const SESSION_TTL_SECONDS = 60 * 60;
-function sessionSecret() {
-  const secret = process.env.CHANPRO_SESSION_SECRET || SUPABASE_SERVICE_ROLE_KEY;
-  if (!secret || String(secret).length < 32) throw new Error("CHANPRO_SESSION_SECRETまたはSUPABASE_SERVICE_ROLE_KEYが必要です");
-  return String(secret);
-}
 function signSession(user) {
-  const now = Math.floor(Date.now() / 1000);
+  if (!SESSION_SECRET) throw Object.assign(new Error("SESSION_SECRET が未設定です"), { status: 503 });
   const payload = Buffer.from(JSON.stringify({
-    sub: String(user.id),
-    username: String(user.username),
-    role: String(user.role || "user"),
-    iat: now,
-    exp: now + SESSION_TTL_SECONDS,
-    user
+    sub: String(user.id), username: String(user.username || ""),
+    exp: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60,
+    iss: "chanpro-gather"
   })).toString("base64url");
-  const signature = crypto.createHmac("sha256", sessionSecret()).update(payload).digest("base64url");
-  return `${payload}.${signature}`;
+  const signature = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  return payload + "." + signature;
 }
-function verifySession(token) {
-  if (!token || typeof token !== "string" || token.length > 20000) {
-    throw Object.assign(new Error("セッションキーがありません。再ログインしてください"), { status: 401 });
-  }
+function readSession(req) {
+  const header = String(req.headers.authorization || "");
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (!token || !SESSION_SECRET) throw Object.assign(new Error("ログイン状態が切れました。再ログインしてください"), { status: 401 });
   const parts = token.split(".");
-  if (parts.length !== 2) throw Object.assign(new Error("セッションキーが不正です。再ログインしてください"), { status: 401 });
-  const expected = crypto.createHmac("sha256", sessionSecret()).update(parts[0]).digest("base64url");
-  if (!safeEqual(parts[1], expected)) throw Object.assign(new Error("セッションキーが不正です。再ログインしてください"), { status: 401 });
+  if (parts.length !== 2) throw Object.assign(new Error("セッションが無効です"), { status: 401 });
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(parts[0]).digest("base64url");
+  if (!safeEqual(expected, parts[1])) throw Object.assign(new Error("セッションが無効です"), { status: 401 });
   let data;
-  try { data = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")); }
-  catch { throw Object.assign(new Error("セッションキーが不正です。再ログインしてください"), { status: 401 }); }
-  if (!data?.user?.id || !data?.exp || data.exp <= Math.floor(Date.now() / 1000)) {
-    throw Object.assign(new Error("セッションキーの有効期限が切れました。再ログインしてください"), { status: 401 });
+  try { data = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")); } catch (_) {
+    throw Object.assign(new Error("セッションが無効です"), { status: 401 });
   }
-  return data.user;
+  if (data.iss !== "chanpro-gather" || !data.sub || Number(data.exp) <= Math.floor(Date.now() / 1000)) {
+    throw Object.assign(new Error("セッションの有効期限が切れました。再ログインしてください"), { status: 401 });
+  }
+  return data;
 }
-function bearerToken(req, body) {
-  const header = String(req.headers?.authorization || req.headers?.Authorization || "");
-  return header.match(/^Bearer\s+(.+)$/i)?.[1] || body.token || "";
+async function authenticateSession(db, req) {
+  const session = readSession(req);
+  const { data: user, error } = await db.from("users")
+    .select("id,username,password_hash,role,verified,ban_until,icon_url,cover_url,profile,settings,program_urls,program_views,program_likes,profile_music,points,stamp_list,login_streak,last_login_date")
+    .eq("id", session.sub).maybeSingle();
+  if (error) throw error;
+  if (!user) throw Object.assign(new Error("ユーザーが見つかりません。再ログインしてください"), { status: 401 });
+  if (user.ban_until && new Date(user.ban_until).getTime() > Date.now()) {
+    throw Object.assign(new Error("このアカウントはBANされています"), { status: 403 });
+  }
+  delete user.password_hash;
+  return { user };
 }
 function client(req) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) throw new Error("Vercel環境変数が設定されていません");
@@ -110,39 +184,76 @@ module.exports = async (req, res) => {
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return json(res, 405, { error: "POST only" });
   try {
+    const ip = getClientIp(req);
+    const ipHash = hashIp(ip);
     const db = client(req);
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const action = String(body.action || "");
+    // Explicit IP BAN and flood protection are checked server-side before any action.
+    await checkIpBan(db, ipHash, ip, action);
+    try {
+      await enforceIpRateLimit(db, ipHash);
+    } catch (limitError) {
+      if (limitError.ipBlocked) await sendPostHogSecurityEvent("chanpro_ip_blocked", ip, { ip_hash: ipHash, action });
+      throw limitError;
+    }
+    if (action === "check-ip") {
+      return json(res, 200, { ok: true, ipCheck: "passed" });
+    }
     if (action === "login" || action === "register") {
       const { username, password } = credentials(body);
-      await checkDeviceBan(db, body.deviceHash);
+      const deviceHash = String(body.deviceHash || "").trim();
+      if (action === "register" && !/^[a-f0-9]{32,128}$/i.test(deviceHash)) {
+        throw Object.assign(new Error("端末情報を確認できません。通常のブラウザで再試行してください"), { status: 400 });
+      }
+      await sendPostHogSecurityEvent(action === "register" ? "chanpro_registration_attempt" : "chanpro_login_attempt", ip, {
+        ip_hash: ipHash, action, username, device_hash: deviceHash || undefined
+      });
+      await checkDeviceBan(db, deviceHash);
       if (action === "register") {
         if (username.length < 2 || password.length < 8) throw Object.assign(new Error("ユーザー名は2文字以上、パスワードは8文字以上にしてください"), { status: 400 });
-        const { data, error } = await db.from("users").insert({
-          username, password_hash: sha256(password), ban_count: 0, ban_until: null,
-          icon_url: "", profile: "", role: "user", points: 0, stamp_list: []
-        }).select("id,username,icon_url,cover_url,profile,role,verified,settings,program_urls,program_views,program_likes,profile_music,points,stamp_list,login_streak,last_login_date").single();
-        if (error) throw error;
-        if (body.deviceHash) await db.from("user_devices").upsert({
-          user_id: data.id, device_hash: body.deviceHash,
+        const { data, error } = await db.rpc("register_account_limited", {
+          p_username: username,
+          p_password_hash: sha256(password),
+          p_device_hash: deviceHash,
+          p_device_info: body.deviceInfo || {}
+        });
+        if (error) {
+          if (/DEVICE_ACCOUNT_LIMIT/.test(error.message || "")) {
+            throw Object.assign(new Error("この端末で作成できる新規アカウントは5個までです"), { status: 429 });
+          }
+          if (error.code === "23505") throw Object.assign(new Error("そのユーザー名は既に使用されています"), { status: 409 });
+          throw error;
+        }
+        const user = data && typeof data === "object" ? data : null;
+        if (!user?.id) throw new Error("新規アカウント作成の応答が不正です");
+        delete user.password_hash;
+        const { error: deviceError } = await db.from("user_devices").upsert({
+          user_id: user.id, device_hash: deviceHash,
           device_info: body.deviceInfo || {}, last_login_at: new Date().toISOString()
         }, { onConflict: "user_id,device_hash" });
-        return json(res, 200, { ok: true, user: data, token: signSession(data), expiresIn: SESSION_TTL_SECONDS });
+        if (deviceError) console.warn("user_devices の記録に失敗:", deviceError.message);
+        await sendPostHogSecurityEvent("chanpro_registration_created", ip, {
+          ip_hash: ipHash, user_id: String(user.id), username: String(user.username || ""), device_hash: deviceHash
+        });
+        return json(res, 200, { ok: true, user, token: signSession(user), isAdmin: false });
       }
       const { user } = await authenticate(db, body);
-      if (body.deviceHash) {
+      if (deviceHash) {
         const { error } = await db.from("user_devices").upsert({
-          user_id: user.id, device_hash: body.deviceHash,
+          user_id: user.id, device_hash: deviceHash,
           device_info: body.deviceInfo || {}, last_login_at: new Date().toISOString()
         }, { onConflict: "user_id,device_hash" });
         if (error) throw error;
       }
       delete user.password_hash;
-      return json(res, 200, { ok: true, user, isAdmin: ["admin", "developer"].includes(user.role), token: signSession(user), expiresIn: SESSION_TTL_SECONDS });
+      await sendPostHogSecurityEvent("chanpro_login_success", ip, {
+        ip_hash: ipHash, user_id: String(user.id), username: String(user.username || ""), device_hash: deviceHash || undefined
+      });
+      return json(res, 200, { ok: true, user, token: signSession(user), isAdmin: ["admin", "developer"].includes(user.role) });
     }
 
-    // All non-login requests use the signed 1-hour session token; do not send/check passwords again.
-    const user = verifySession(bearerToken(req, body));
+    const { user } = await authenticateSession(db, req);
     const admin = ["admin", "developer"].includes(user.role);
     const payload = body.payload || {};
     switch (action) {
@@ -337,12 +448,36 @@ module.exports = async (req, res) => {
         if (error) throw error;
         return json(res, 200, { ok: true });
       }
+      case "ip-ban": {
+        if (!admin) throw Object.assign(new Error("管理者権限が必要です"), { status: 403 });
+        const rawIp = String(payload.ipAddress || "").trim();
+        if (!rawIp || rawIp.length > 100 || !/^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(rawIp)) {
+          throw Object.assign(new Error("IPアドレスの形式が不正です"), { status: 400 });
+        }
+        const minutes = Math.max(1, Math.min(525600, Number(payload.minutes) || 60));
+        const { error } = await db.from("banned_ip_addresses").upsert({
+          ip_hash: hashIp(rawIp), reason: String(payload.reason || "管理者によるIP BAN").slice(0, 300),
+          expires_at: new Date(Date.now() + minutes * 60000).toISOString(), created_by: user.id
+        }, { onConflict: "ip_hash" });
+        if (error) throw error;
+        return json(res, 200, { ok: true, expiresAt: new Date(Date.now() + minutes * 60000).toISOString() });
+      }
+      case "ip-unban": {
+        if (!admin) throw Object.assign(new Error("管理者権限が必要です"), { status: 403 });
+        const rawIp = String(payload.ipAddress || "").trim();
+        if (!rawIp || rawIp.length > 100 || !/^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(rawIp)) {
+          throw Object.assign(new Error("IPアドレスの形式が不正です"), { status: 400 });
+        }
+        const { error } = await db.from("banned_ip_addresses").delete().eq("ip_hash", hashIp(rawIp));
+        if (error) throw error;
+        return json(res, 200, { ok: true });
+      }
       default:
         return json(res, 400, { error: "未対応のAPI操作です", action });
     }
   } catch (error) {
-    // Avoid high-volume log ingestion; return errors to the caller without logging every expected 4xx.
-    if (!error.status || error.status >= 500) console.error("secure API server error");
-    return json(res, error.status || 500, { error: error.message || "サーバー処理に失敗しました" });
+    console.error("secure API error:", error.message || error);
+    if (error.retryAfter) res.setHeader("Retry-After", String(error.retryAfter));
+    return json(res, error.status || 500, { error: error.message || "サーバー処理に失敗しました", retryAfter: error.retryAfter || undefined });
   }
 };
