@@ -333,8 +333,33 @@ module.exports = async (req, res) => {
         return json(res, 200, { ok: true, user: data, message: "アカウント情報を更新しました" });
       }
       case "user-settings": {
+        const input = payload.settings && typeof payload.settings === "object" && !Array.isArray(payload.settings) ? payload.settings : {};
         const settings = {};
-        for (const key of settingFields) if (Object.prototype.hasOwnProperty.call(payload.settings || {}, key)) settings[key] = payload.settings[key];
+        for (const key of settingFields) {
+          if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
+          const value = input[key];
+          if (["home_chat_enabled", "manual_chat_join", "chat_sound_enabled", "post_notification_sound_enabled"].includes(key)) {
+            if (typeof value !== "boolean") throw Object.assign(new Error(`設定値が不正です: ${key}`), { status: 400 });
+            settings[key] = value;
+          } else if (key === "notification_volume") {
+            const volume = Number(value);
+            if (!Number.isFinite(volume) || volume < 0 || volume > 1) throw Object.assign(new Error("通知音量は0〜1で指定してください"), { status: 400 });
+            settings[key] = volume;
+          } else if (key === "home_chat_width") {
+            const width = Number(value);
+            if (!Number.isFinite(width) || width < 240 || width > 760) throw Object.assign(new Error("チャット幅は240〜760pxで指定してください"), { status: 400 });
+            settings[key] = Math.round(width);
+          } else if (key === "default_chat_room") {
+            const room = String(value || "room").trim();
+            if (!room || room.length > 100) throw Object.assign(new Error("チャットルーム名が不正です"), { status: 400 });
+            settings[key] = room;
+          } else if (key === "chat_theme") {
+            const theme = String(value || "blue");
+            if (!["blue", "green", "red", "dark"].includes(theme)) throw Object.assign(new Error("チャットテーマが不正です"), { status: 400 });
+            settings[key] = theme;
+          }
+        }
+        if (!Object.keys(settings).length) throw Object.assign(new Error("保存する設定がありません"), { status: 400 });
         const { data, error } = await db.from("users").update({ settings: { ...(user.settings || {}), ...settings } }).eq("id", user.id).select("settings").single();
         if (error) throw error;
         return json(res, 200, { ok: true, settings: data.settings });
