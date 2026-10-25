@@ -4,40 +4,13 @@ const crypto = require("node:crypto");
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-
 const IP_HASH_SECRET = process.env.IP_HASH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const POSTHOG_PROJECT_KEY = process.env.POSTHOG_PROJECT_KEY || "";
-const POSTHOG_PERSONAL_API_KEY = process.env.POSTHOG_PERSONAL_API_KEY || "";
-const POSTHOG_PROJECT_ID = process.env.POSTHOG_PROJECT_ID || "";
-
-// PostHog APIホストを先に初期化
-const POSTHOG_API_HOST = (
-  process.env.POSTHOG_API_HOST || "https://us.i.posthog.com"
-).replace(/\/$/, "");
-
-// APIホストの初期化後にアプリホストを設定
-const POSTHOG_APP_HOST = (
-  process.env.POSTHOG_APP_HOST ||
-  POSTHOG_API_HOST.replace(".i.posthog.com", ".posthog.com")
-).replace(/\/$/, "");
-
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-
-const IP_RATE_LIMIT = Math.max(
-  20,
-  Number(process.env.IP_RATE_LIMIT || 120)
-);
-
-const IP_RATE_WINDOW_SECONDS = Math.max(
-  60,
-  Number(process.env.IP_RATE_WINDOW_SECONDS || 300)
-);
-
-const IP_BLOCK_SECONDS = Math.max(
-  60,
-  Number(process.env.IP_BLOCK_SECONDS || 3600)
-);
-
+const POSTHOG_API_HOST = (process.env.POSTHOG_API_HOST || "https://us.i.posthog.com").replace(/\/$/, "");
+const IP_RATE_LIMIT = Math.max(20, Number(process.env.IP_RATE_LIMIT || 120));
+const IP_RATE_WINDOW_SECONDS = Math.max(60, Number(process.env.IP_RATE_WINDOW_SECONDS || 300));
+const IP_BLOCK_SECONDS = Math.max(60, Number(process.env.IP_BLOCK_SECONDS || 3600));
 
 function getClientIp(req) {
   // Vercel が付与する接続元IPを優先。クライアントのJSON本文からIPを受け取らない。
@@ -186,67 +159,6 @@ async function authenticate(db, body, { allowBanned = false } = {}) {
   }
   return { user, password };
 }
-function deviceDistinctId(deviceHash) {
-  return "chanpro-device-" + String(deviceHash || "").toLowerCase();
-}
-async function findPostHogDevicePerson(deviceHash) {
-  if (!deviceHash) return { available: false, found: false, banned: false };
-  if (!POSTHOG_PERSONAL_API_KEY || !POSTHOG_PROJECT_ID) {
-    console.warn("PostHog端末BAN: POSTHOG_PERSONAL_API_KEY / POSTHOG_PROJECT_ID が未設定です");
-    return { available: false, found: false, banned: false };
-  }
-  const url = POSTHOG_APP_HOST + "/api/projects/" + encodeURIComponent(POSTHOG_PROJECT_ID) + "/persons/?search=" + encodeURIComponent(deviceDistinctId(deviceHash)) + "&limit=100";
-  const response = await fetch(url, {
-    method: "GET",
-    headers: { Authorization: "Bearer " + POSTHOG_PERSONAL_API_KEY, Accept: "application/json" },
-    signal: AbortSignal.timeout(5000)
-  });
-  if (!response.ok) {
-    const detail = (await response.text().catch(() => "")).slice(0, 300);
-    console.error("PostHog Persons API error:", response.status, detail);
-    throw Object.assign(new Error("PostHog Personsで端末BANを確認できません。VercelのPostHog APIキー・Project ID・権限を確認してください"), { status: 503 });
-  }
-  const body = await response.json();
-  const results = Array.isArray(body?.results) ? body.results : Array.isArray(body) ? body : [];
-  const wanted = deviceDistinctId(deviceHash);
-  const person = results.find(p => Array.isArray(p?.distinct_ids) && p.distinct_ids.includes(wanted)) ||
-    results.find(p => String(p?.properties?.device_hash || "") === String(deviceHash));
-  return { available: true, found: !!person, banned: person?.properties?.device_banned === true || String(person?.properties?.device_banned).toLowerCase() === "true", person };
-}
-async function recordPostHogDevice(deviceHash, deviceInfo = {}, user = null, isNewPerson = false) {
-  if (!deviceHash || !POSTHOG_PROJECT_KEY) return;
-  const set = {
-    device_hash: String(deviceHash),
-    device_info: deviceInfo && typeof deviceInfo === "object" ? deviceInfo : {},
-    device_last_seen_at: new Date().toISOString()
-  };
-  if (user?.id) set.last_user_id = String(user.id);
-  if (user?.username) set.last_username = String(user.username).slice(0, 100);
-  // Only initialize the BAN property for a new Person. Never clear a BAN during login.
-  if (isNewPerson) set.device_banned = false;
-  try {
-    const response = await fetch(POSTHOG_API_HOST + "/capture/", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        api_key: POSTHOG_PROJECT_KEY,
-        event: "chanpro_device_seen",
-        distinct_id: deviceDistinctId(deviceHash),
-        properties: { $set: set, device_hash: String(deviceHash), event_source: "chanpro-vercel-secure" }
-      }),
-      signal: AbortSignal.timeout(3000)
-    });
-    if (!response.ok) console.warn("PostHog端末Personの記録に失敗:", response.status);
-  } catch (error) { console.warn("PostHog端末Personの記録に失敗:", error?.message || error); }
-}
-async function checkDeviceBan(deviceHash, deviceInfo = {}, user = null) {
-  if (!deviceHash) return;
-  const found = await findPostHogDevicePerson(deviceHash);
-  if (found.banned) {
-    await sendPostHogSecurityEvent("chanpro_device_banned_request", "0.0.0.0", { device_hash: deviceHash, username: user?.username || undefined });
-    throw Object.assign(new Error("この端末はPostHog PersonsでBANされています"), { status: 403 });
-  }
-  await recordPostHogDevice(deviceHash, deviceInfo, user, !found.found);
-}
 const ownUserFields = [
   "icon_url", "cover_url", "profile", "program_urls", "profile_music"
 ];
@@ -292,7 +204,6 @@ module.exports = async (req, res) => {
       await sendPostHogSecurityEvent(action === "register" ? "chanpro_registration_attempt" : "chanpro_login_attempt", ip, {
         ip_hash: ipHash, action, username, device_hash: deviceHash || undefined
       });
-      await checkDeviceBan(deviceHash, body.deviceInfo || {}, null);
       if (action === "register") {
         if (username.length < 2 || password.length < 8) throw Object.assign(new Error("ユーザー名は2文字以上、パスワードは8文字以上にしてください"), { status: 400 });
         const { data, error } = await db.rpc("register_account_limited", {
@@ -311,7 +222,6 @@ module.exports = async (req, res) => {
         const user = data && typeof data === "object" ? data : null;
         if (!user?.id) throw new Error("新規アカウント作成の応答が不正です");
         delete user.password_hash;
-        await recordPostHogDevice(deviceHash, body.deviceInfo || {}, user, false);
         const { error: deviceError } = await db.from("user_devices").upsert({
           user_id: user.id, device_hash: deviceHash,
           device_info: body.deviceInfo || {}, last_login_at: new Date().toISOString()
@@ -323,7 +233,6 @@ module.exports = async (req, res) => {
         return json(res, 200, { ok: true, user, token: signSession(user), isAdmin: false });
       }
       const { user } = await authenticate(db, body);
-      if (deviceHash) await recordPostHogDevice(deviceHash, body.deviceInfo || {}, user, false);
       if (deviceHash) {
         const { error } = await db.from("user_devices").upsert({
           user_id: user.id, device_hash: deviceHash,
@@ -342,14 +251,6 @@ module.exports = async (req, res) => {
     const admin = ["admin", "developer"].includes(user.role);
     const payload = body.payload || {};
     switch (action) {
-      case "device-ban-check": {
-        const deviceHash = String(payload.deviceHash || "").trim();
-        if (!/^[a-f0-9]{32,128}$/i.test(deviceHash)) throw Object.assign(new Error("端末識別IDが不正です"), { status: 400 });
-        const found = await findPostHogDevicePerson(deviceHash);
-        if (found.banned) throw Object.assign(new Error("この端末はPostHog PersonsでBANされています"), { status: 403 });
-        await recordPostHogDevice(deviceHash, payload.deviceInfo || {}, user, !found.found);
-        return json(res, 200, { ok: true, available: found.available, banned: false, deviceDistinctId: deviceDistinctId(deviceHash) });
-      }
       case "limited-post-list": {
         if (!user.verified && !admin) return json(res, 200, { ok: true, posts: [] });
         const { data, error } = await db.from("posts").select("id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at").eq("is_limited", true).order("created_at", { ascending: false }).limit(50);
@@ -653,26 +554,6 @@ module.exports = async (req, res) => {
         const { error } = await db.from("users").update(patch).eq("id", targetId);
         if (error) throw error;
         return json(res, 200, { ok: true });
-      }
-      case "device-ban":
-      case "device-unban": {
-        if (!admin) throw Object.assign(new Error("管理者権限が必要です"), { status: 403 });
-        const deviceHash = String(payload.deviceHash || "").trim();
-        if (!/^[a-f0-9]{32,128}$/i.test(deviceHash)) throw Object.assign(new Error("端末識別IDが不正です"), { status: 400 });
-        if (!POSTHOG_PROJECT_KEY) throw Object.assign(new Error("POSTHOG_PROJECT_KEY がVercelに設定されていません"), { status: 503 });
-        const banned = action === "device-ban";
-        const response = await fetch(POSTHOG_API_HOST + "/capture/", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            api_key: POSTHOG_PROJECT_KEY,
-            event: banned ? "chanpro_device_banned" : "chanpro_device_unbanned",
-            distinct_id: deviceDistinctId(deviceHash),
-            properties: { $set: { device_hash: deviceHash, device_banned: banned, device_ban_updated_at: new Date().toISOString(), device_ban_updated_by: String(user.id) }, device_hash: deviceHash, event_source: "chanpro-vercel-secure" }
-          }),
-          signal: AbortSignal.timeout(4000)
-        });
-        if (!response.ok) throw Object.assign(new Error("PostHog Personsの端末BAN設定に失敗しました"), { status: 503 });
-        return json(res, 200, { ok: true, deviceHash, banned, deviceDistinctId: deviceDistinctId(deviceHash), note: "PostHogの反映には数秒かかる場合があります" });
       }
       case "ip-ban": {
         if (!admin) throw Object.assign(new Error("管理者権限が必要です"), { status: 403 });
