@@ -257,6 +257,39 @@ module.exports = async (req, res) => {
     const admin = ["admin", "developer"].includes(user.role);
     const payload = body.payload || {};
     switch (action) {
+      case "post-create": {
+        const content = String(payload.content || "");
+        const imageUrl = payload.image_url == null ? null : String(payload.image_url);
+        const quotePostId = payload.quote_post_id == null ? null : String(payload.quote_post_id);
+        if (!content.trim() && !imageUrl && !quotePostId && !payload.poll) throw Object.assign(new Error("投稿内容を入力してください"), { status: 400 });
+        if (content.length > 100000) throw Object.assign(new Error("投稿内容が長すぎます"), { status: 400 });
+        if (imageUrl && imageUrl.length > 10000) throw Object.assign(new Error("画像URLが長すぎます"), { status: 400 });
+        const isLimited = !!payload.is_limited && !!user.verified;
+        const row = { user_id: user.id, content, image_url: imageUrl, is_limited: isLimited, quote_post_id: quotePostId, poll: payload.poll || null, views: 0 };
+        const { data, error } = await db.from("posts").insert(row).select("*").single();
+        if (error) throw error;
+        return json(res, 200, { ok: true, post: data });
+      }
+      case "reply-create": {
+        const postId = String(payload.post_id || "");
+        const content = String(payload.content || "").trim();
+        const parentReplyId = payload.parent_reply_id == null ? null : String(payload.parent_reply_id);
+        if (!postId || !content) throw Object.assign(new Error("返信内容を入力してください"), { status: 400 });
+        if (content.length > 20000) throw Object.assign(new Error("返信内容が長すぎます"), { status: 400 });
+        const { data: post, error: postError } = await db.from("posts").select("id,user_id,is_limited").eq("id", postId).maybeSingle();
+        if (postError) throw postError;
+        if (!post) throw Object.assign(new Error("返信先の投稿が見つかりません"), { status: 404 });
+        if (post.is_limited && post.user_id !== user.id && !admin) throw Object.assign(new Error("この限定投稿には返信できません"), { status: 403 });
+        if (parentReplyId) {
+          const { data: parent, error: parentError } = await db.from("replies").select("id,post_id").eq("id", parentReplyId).maybeSingle();
+          if (parentError) throw parentError;
+          if (!parent || String(parent.post_id) !== postId) throw Object.assign(new Error("返信先が見つかりません"), { status: 400 });
+        }
+        const row = { post_id: postId, user_id: user.id, content, parent_reply_id: parentReplyId };
+        const { data, error } = await db.from("replies").insert(row).select("id,post_id,user_id,content,parent_reply_id,created_at").single();
+        if (error) throw error;
+        return json(res, 200, { ok: true, reply: data });
+      }
       case "dm-list": {
         let q = db.from("messages").select("id,sender_id,receiver_id,content,created_at");
         q = payload.withUserId
