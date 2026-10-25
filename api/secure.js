@@ -170,7 +170,8 @@ const ownUserFields = [
 ];
 const settingFields = [
   "home_chat_enabled", "manual_chat_join", "default_chat_room",
-  "chat_sound_enabled", "chat_theme", "notification_volume"
+  "chat_sound_enabled", "chat_theme", "notification_volume",
+  "home_chat_width", "post_notification_sound_enabled"
 ];
 
 module.exports = async (req, res) => {
