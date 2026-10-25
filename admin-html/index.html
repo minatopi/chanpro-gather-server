@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Chanpro 管理サイト</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,sans-serif;background:#0f1115;color:#e6e8ee}
+main{max-width:1100px;margin:0 auto;padding:20px}h1{font-size:20px;margin:0}h2{font-size:16px;margin:20px 0 8px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}
+button,input,select{font:inherit;color:inherit;background:#1b1f27;border:1px solid #2d3340;border-radius:6px;padding:6px 10px}
+button{cursor:pointer}button:hover{background:#252b36}button.on{background:#2f5bd8;border-color:#2f5bd8}button.danger{border-color:#a33}
+.card{background:#161a21;border:1px solid #262c38;border-radius:8px;padding:12px;margin:8px 0}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.between{justify-content:space-between}
+.tw{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #242a35;vertical-align:top;word-break:break-all}
+.muted{color:#8b93a5}.err{color:#ff7b7b}.ok{color:#6fd48a}
+#login{max-width:360px;margin:120px auto}
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script>
+"use strict";
+const app = document.getElementById("app");
+// 安全なDOM生成(文字列は常にテキストとして挿入 → XSSにならない)
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k.startsWith("on")) el[k] = v;
+    else if (k === "class") el.className = v;
+    else if (k === "value") el.value = v;
+    else el.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) if (c != null && c !== false) el.append(c.nodeType ? c : document.createTextNode(String(c)));
+  return el;
+}
+const fmt = (t) => (t ? new Date(t).toLocaleString("ja-JP") : "");
+async function api(action, data = {}) {
+  const r = await fetch("/api/admin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, ...data }) });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && action !== "login") { showLogin(); throw new Error("ログインが必要です"); }
+  if (!r.ok) throw new Error(j.error || "エラー");
+  return j;
+}
+function table(rows, cols) {
+  if (!rows || !rows.length) return h("p", { class: "muted" }, "データなし");
+  return h("div", { class: "tw" }, h("table", {},
+    h("thead", {}, h("tr", {}, cols.map((c) => h("th", {}, c.l)))),
+    h("tbody", {}, rows.map((r) => h("tr", {}, cols.map((c) => h("td", {}, c.f ? c.f(r) : String(r[c.k] ?? ""))))))));
+}
+// 画面を再描画する小さな仕組み
+function panel(render) {
+  const box = h("div");
+  const msg = h("p", { class: "err" });
+  const run = async () => {
+    msg.textContent = "";
+    try { box.replaceChildren(msg, await render(run)); } catch (e) { msg.textContent = e.message; box.replaceChildren(msg); }
+  };
+  run();
+  return box;
+}
+
+/* ---------- ログイン ---------- */
+function showLogin() {
+  const pw = h("input", { type: "password", placeholder: "ADMIN_PASSWORD", style: "flex:1" });
+  const err = h("p", { class: "err" });
+  const go = async (e) => {
+    e.preventDefault(); err.textContent = "";
+    try { await api("login", { password: pw.value }); showAdmin(); } catch (x) { err.textContent = x.message; }
+  };
+  app.replaceChildren(h("div", { id: "login" }, h("h1", {}, "Chanpro 管理"), h("form", { class: "row", onsubmit: go, style: "margin-top:12px" }, pw, h("button", { class: "on" }, "ログイン")), err));
+  pw.focus();
+}
+
+/* ---------- 停止設定 ---------- */
+function settingsTab() {
+  return panel(async (reload) => {
+    const { settings: s } = await api("settings-get");
+    const set = (key, value) => api("settings-set", { key, value }).then(reload).catch((e) => alert(e.message));
+    const block = (k, label, mk) => {
+      const stopped = s[k] === false;
+      const m = h("input", { style: "flex:1", value: s[mk] || "", placeholder: "停止中に表示するメッセージ" });
+      m.onchange = () => set(mk, m.value);
+      return h("div", { class: "card" },
+        h("div", { class: "row" }, h("b", {}, label), h("span", { class: stopped ? "err" : "ok" }, stopped ? "停止中" : "稼働中"),
+          h("button", { class: stopped ? "on" : "danger", onclick: () => set(k, stopped) }, stopped ? "再開する" : "停止する")),
+        h("div", { class: "row", style: "margin-top:8px" }, m));
+    };
+    return h("div", {}, block("login_enabled", "ログイン", "login_disabled_message"), block("register_enabled", "新規アカウント作成", "register_disabled_message"),
+      h("p", { class: "muted" }, "※ログイン停止中も admin / developer はログインできます。"));
+  });
+}
+
+/* ---------- ユーザー ---------- */
+function usersTab() {
+  let q = "", sel = null;
+  const wrap = h("div");
+  const draw = () => wrap.replaceChildren(panel(async (reload) => {
+    const { users } = await api("users-list", { q });
+    const patch = (id, p) => api("user-update", { id, ...p }).then(reload).catch((e) => alert(e.message));
+    const search = h("input", { placeholder: "ユーザー名で検索", value: q });
+    search.onkeydown = (e) => { if (e.key === "Enter") { q = search.value; draw(); } };
+    const detail = h("div");
+    if (sel) {
+      detail.append(h("div", { class: "card" }, h("b", {}, `${sel.username} のアクセス先(7日)`), " ", h("button", { onclick: () => { sel = null; draw(); } }, "閉じる"),
+        panel(async () => {
+          const { top, recent } = await api("posthog", { userId: sel.id, username: sel.username, days: 7 });
+          return h("div", {}, h("h2", {}, "よく見たページ"),
+            table(top, [{ l: "パス", k: "path" }, { l: "回数", k: "views" }, { l: "最終", f: (r) => fmt(r.last_seen) }]),
+            h("h2", {}, "最近の履歴"),
+            table(recent, [{ l: "時刻", f: (r) => fmt(r.timestamp) }, { l: "種別", k: "event" }, { l: "URL", k: "url" }, { l: "IP", k: "ip" }]));
+        })));
+    }
+    return h("div", {}, h("div", { class: "row" }, search, h("button", { onclick: () => { q = search.value; draw(); } }, "検索")),
+      table(users, [
+        { l: "ユーザー", k: "username" },
+        { l: "権限", f: (u) => { const s = h("select", {}, ["user", "admin", "developer"].map((r) => h("option", { value: r }, r))); s.value = u.role; s.onchange = () => patch(u.id, { role: s.value }); return s; } },
+        { l: "公式バッジ", f: (u) => h("button", { class: u.verified ? "on" : "", onclick: () => patch(u.id, { verified: !u.verified }) }, u.verified ? "✓ 付与中" : "なし") },
+        { l: "BAN", f: (u) => u.ban_until && new Date(u.ban_until) > new Date()
+            ? [fmt(u.ban_until) + " ", h("button", { onclick: () => patch(u.id, { banMinutes: 0 }) }, "解除")]
+            : h("button", { class: "danger", onclick: () => { const m = prompt("BAN時間(分)", "60"); if (m) patch(u.id, { banMinutes: Number(m) }); } }, "BAN") },
+        { l: "pt", k: "points" },
+        { l: "アクセス", f: (u) => h("button", { onclick: () => { sel = u; draw(); } }, "PostHog") }
+      ]), detail);
+  }));
+  draw();
+  return wrap;
+}
+
+/* ---------- IP BAN ---------- */
+function ipTab() {
+  return panel(async (reload) => {
+    const { bans } = await api("ip-bans-list");
+    const ip = h("input", { placeholder: "IPアドレス" }), min = h("input", { type: "number", value: 60, style: "width:100px" }), reason = h("input", { placeholder: "理由" });
+    return h("div", {},
+      h("div", { class: "row" }, ip, min, "分", reason,
+        h("button", { class: "danger", onclick: () => api("ip-ban", { ip: ip.value, minutes: Number(min.value), reason: reason.value }).then(reload).catch((e) => alert(e.message)) }, "IP BAN")),
+      h("p", { class: "muted" }, "IPはハッシュ化して保存されるため、一覧はハッシュの先頭のみ表示されます。"),
+      table(bans, [{ l: "IPハッシュ", f: (b) => b.ip_hash.slice(0, 16) + "…" }, { l: "理由", k: "reason" }, { l: "期限", f: (b) => fmt(b.expires_at) },
+        { l: "", f: (b) => h("button", { onclick: () => api("ip-unban", { ip_hash: b.ip_hash }).then(reload) }, "解除") }]));
+  });
+}
+
+/* ---------- 報告 ---------- */
+function reportsTab() {
+  let st = "open";
+  const wrap = h("div");
+  const draw = () => wrap.replaceChildren(panel(async (reload) => {
+    const { reports } = await api("reports-list", { status: st });
+    const set = (id, status) => api("report-update", { id, status }).then(reload).catch((e) => alert(e.message));
+    return h("div", {}, h("div", { class: "row" }, ["open", "resolved", "dismissed"].map((s) => h("button", { class: st === s ? "on" : "", onclick: () => { st = s; draw(); } }, s))),
+      table(reports, [{ l: "日時", f: (r) => fmt(r.created_at) }, { l: "報告者", k: "username" }, { l: "内容", k: "content" },
+        { l: "", f: (r) => h("div", { class: "row" }, h("button", { onclick: () => set(r.id, "resolved") }, "対応済"), h("button", { onclick: () => set(r.id, "dismissed") }, "却下"), h("button", { onclick: () => set(r.id, "open") }, "未対応")) }]));
+  }));
+  draw();
+  return wrap;
+}
+
+/* ---------- ログ(Axiom) ---------- */
+function logsTab() {
+  let kind = "login", hours = 24, username = "";
+  const wrap = h("div");
+  const draw = () => wrap.replaceChildren(panel(async () => {
+    const sel = h("select", {}, [1, 24, 72, 168, 720].map((x) => h("option", { value: x }, `直近${x}時間`))); sel.value = hours;
+    const u = h("input", { placeholder: "ユーザー名で絞り込み", value: username });
+    const apply = () => { hours = sel.value; username = u.value; draw(); };
+    const bar = h("div", { class: "row" }, [["login", "ログイン"], ["access", "アクセス"], ["ip", "IP制限"]].map(([k, l]) => h("button", { class: kind === k ? "on" : "", onclick: () => { kind = k; draw(); } }, l)), sel, u, h("button", { onclick: apply }, "更新"));
+    const { rows } = await api("logs", { kind, hours, username });
+    return h("div", {}, bar, table(rows, [{ l: "時刻", f: (r) => fmt(r._time) }, { l: "種別", k: "type" }, { l: "ユーザー", k: "username" }, { l: "IP", k: "ip" }, { l: "操作", k: "action" }, { l: "ページ", k: "page" }, { l: "理由", k: "reason" }]));
+  }));
+  draw();
+  return wrap;
+}
+
+/* ---------- 全体 ---------- */
+function showAdmin() {
+  const tabs = [["settings", "停止設定", settingsTab], ["users", "ユーザー", usersTab], ["ip", "IP BAN", ipTab], ["reports", "報告", reportsTab], ["logs", "ログ(Axiom)", logsTab]];
+  const body = h("div"), bar = h("div", { class: "tabs" });
+  const open = (i) => { [...bar.children].forEach((b, j) => b.classList.toggle("on", i === j)); body.replaceChildren(tabs[i][2]()); };
+  tabs.forEach(([, l], i) => bar.append(h("button", { onclick: () => open(i) }, l)));
+  app.replaceChildren(h("div", { class: "row between" }, h("h1", {}, "Chanpro 管理サイト"), h("button", { onclick: () => api("logout").then(showLogin) }, "ログアウト")), bar, body);
+  open(0);
+}
+
+api("me").then(showAdmin).catch(showLogin);
+</script>
+</body>
+</html>
