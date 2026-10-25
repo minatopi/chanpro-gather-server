@@ -38,7 +38,7 @@ function h(tag, props, ...kids) {
 }
 const fmt = (t) => (t ? new Date(t).toLocaleString("ja-JP") : "");
 async function api(action, data = {}) {
-  const r = await fetch("/admin-html/api/admin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, ...data }) });
+  const r = await fetch("/admin-html/api/admin.js", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, ...data }) });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401 && action !== "login") { showLogin(); throw new Error("ログインが必要です"); }
   if (!r.ok) throw new Error(j.error || "エラー");
