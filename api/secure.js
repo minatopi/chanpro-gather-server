@@ -12,6 +12,33 @@ const IP_RATE_LIMIT = Math.max(20, Number(process.env.IP_RATE_LIMIT || 120));
 const IP_RATE_WINDOW_SECONDS = Math.max(60, Number(process.env.IP_RATE_WINDOW_SECONDS || 300));
 const IP_BLOCK_SECONDS = Math.max(60, Number(process.env.IP_BLOCK_SECONDS || 3600));
 
+// ---- [管理サイト連携] Axiom ログ & 停止設定 ----
+const AXIOM_TOKEN = process.env.AXIOM_TOKEN || "";
+const AXIOM_DATASET = process.env.AXIOM_DATASET || "chanpro";
+
+async function axiomLog(type, ip, props = {}) {
+  if (!AXIOM_TOKEN) return;
+  try {
+    await fetch(`https://api.axiom.co/v1/datasets/${AXIOM_DATASET}/ingest`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${AXIOM_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify([{ _time: new Date().toISOString(), source: "gather-api", type, ip, ...props }]),
+      signal: AbortSignal.timeout(2500)
+    });
+  } catch (e) {
+    console.warn("Axiom log failed:", e?.message || e);
+  }
+}
+async function isEnabled(db, key) {
+  const { data } = await db.from("app_settings").select("value").eq("key", key).maybeSingle();
+  return !(data && data.value === false);
+}
+async function settingMessage(db, key, fallback) {
+  const { data } = await db.from("app_settings").select("value").eq("key", key).maybeSingle();
+  return (typeof data?.value === "string" && data.value) || fallback;
+}
+// ------------------------------------------------
+
 function getClientIp(req) {
   // Vercel が付与する接続元IPを優先。クライアントのJSON本文からIPを受け取らない。
   const real = req.headers["x-real-ip"];
@@ -58,6 +85,7 @@ async function checkIpBan(db, ipHash, ip, action) {
   if (error) throw error;
   if (data && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now())) {
     await sendPostHogSecurityEvent("chanpro_ip_banned_request", ip, { ip_hash: ipHash, action, reason: data.reason || "IP BAN" });
+    await axiomLog("ip_banned_request", ip, { ip_hash: ipHash, action, reason: data.reason || "IP BAN" });
     throw Object.assign(new Error(data.reason || "このIPアドレスからのアクセスは禁止されています"), { status: 403 });
   }
 }
@@ -189,7 +217,10 @@ module.exports = async (req, res) => {
     try {
       await enforceIpRateLimit(db, ipHash);
     } catch (limitError) {
-      if (limitError.ipBlocked) await sendPostHogSecurityEvent("chanpro_ip_blocked", ip, { ip_hash: ipHash, action });
+      if (limitError.ipBlocked) {
+        await sendPostHogSecurityEvent("chanpro_ip_blocked", ip, { ip_hash: ipHash, action });
+        await axiomLog("ip_rate_limited", ip, { ip_hash: ipHash, action });
+      }
       throw limitError;
     }
     if (action === "check-ip") {
@@ -205,6 +236,11 @@ module.exports = async (req, res) => {
         ip_hash: ipHash, action, username, device_hash: deviceHash || undefined
       });
       if (action === "register") {
+        // [管理サイト連携] 新規作成停止
+        if (!(await isEnabled(db, "register_enabled"))) {
+          await axiomLog("register_blocked", ip, { ip_hash: ipHash, username });
+          throw Object.assign(new Error(await settingMessage(db, "register_disabled_message", "現在新規作成を停止しています")), { status: 503 });
+        }
         if (username.length < 2 || password.length < 8) throw Object.assign(new Error("ユーザー名は2文字以上、パスワードは8文字以上にしてください"), { status: 400 });
         const { data, error } = await db.rpc("register_account_limited", {
           p_username: username,
@@ -230,9 +266,22 @@ module.exports = async (req, res) => {
         await sendPostHogSecurityEvent("chanpro_registration_created", ip, {
           ip_hash: ipHash, user_id: String(user.id), username: String(user.username || ""), device_hash: deviceHash
         });
+        await axiomLog("register_created", ip, { ip_hash: ipHash, user_id: String(user.id), username: String(user.username || "") });
         return json(res, 200, { ok: true, user, token: signSession(user), isAdmin: false });
       }
-      const { user } = await authenticate(db, body);
+      // [管理サイト連携] ログイン失敗ログ
+      let user;
+      try {
+        ({ user } = await authenticate(db, body));
+      } catch (e) {
+        await axiomLog("login_failed", ip, { ip_hash: ipHash, username, status: e.status || 500 });
+        throw e;
+      }
+      // [管理サイト連携] ログイン停止(admin / developer は除外)
+      if (!["admin", "developer"].includes(user.role) && !(await isEnabled(db, "login_enabled"))) {
+        await axiomLog("login_blocked", ip, { ip_hash: ipHash, username, user_id: String(user.id) });
+        throw Object.assign(new Error(await settingMessage(db, "login_disabled_message", "現在ログインを停止しています")), { status: 503 });
+      }
       if (deviceHash) {
         const { error } = await db.from("user_devices").upsert({
           user_id: user.id, device_hash: deviceHash,
@@ -244,12 +293,18 @@ module.exports = async (req, res) => {
       await sendPostHogSecurityEvent("chanpro_login_success", ip, {
         ip_hash: ipHash, user_id: String(user.id), username: String(user.username || ""), device_hash: deviceHash || undefined
       });
+      await axiomLog("login_success", ip, { ip_hash: ipHash, user_id: String(user.id), username: String(user.username || ""), device_hash: deviceHash || undefined });
       return json(res, 200, { ok: true, user, token: signSession(user), isAdmin: ["admin", "developer"].includes(user.role) });
     }
 
     const { user } = await authenticateSession(db, req);
     const admin = ["admin", "developer"].includes(user.role);
     const payload = body.payload || {};
+    // [管理サイト連携] アクセスログ(body.page にフロントの現在ページを入れると記録されます)
+    await axiomLog("access", ip, {
+      ip_hash: ipHash, action, page: String(body.page || req.headers.referer || "").slice(0, 300),
+      user_id: String(user.id), username: String(user.username || "")
+    });
     switch (action) {
       case "limited-post-list": {
         if (!user.verified && !admin) return json(res, 200, { ok: true, posts: [] });
@@ -510,7 +565,8 @@ module.exports = async (req, res) => {
       case "report": {
         const message = String(payload.message || "").trim();
         if (!message || message.length > 5000) throw Object.assign(new Error("報告内容を入力してください"), { status: 400 });
-        const { error } = await db.from("reports").insert({ user_id: user.id, message });
+        // [管理サイト連携] 報告は gather_reports に保存
+        const { error } = await db.from("gather_reports").insert({ user_id: user.id, username: user.username, content: message });
         if (error) throw error;
         return json(res, 200, { ok: true, message: "報告を送信しました" });
       }
