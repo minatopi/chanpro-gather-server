@@ -4,16 +4,40 @@ const crypto = require("node:crypto");
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+
 const IP_HASH_SECRET = process.env.IP_HASH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const POSTHOG_PROJECT_KEY = process.env.POSTHOG_PROJECT_KEY || "";
 const POSTHOG_PERSONAL_API_KEY = process.env.POSTHOG_PERSONAL_API_KEY || "";
 const POSTHOG_PROJECT_ID = process.env.POSTHOG_PROJECT_ID || "";
-const POSTHOG_APP_HOST = (process.env.POSTHOG_APP_HOST || POSTHOG_API_HOST.replace(".i.posthog.com", ".posthog.com")).replace(/\/$/, "");
+
+// PostHog APIホストを先に初期化
+const POSTHOG_API_HOST = (
+  process.env.POSTHOG_API_HOST || "https://us.i.posthog.com"
+).replace(/\/$/, "");
+
+// APIホストの初期化後にアプリホストを設定
+const POSTHOG_APP_HOST = (
+  process.env.POSTHOG_APP_HOST ||
+  POSTHOG_API_HOST.replace(".i.posthog.com", ".posthog.com")
+).replace(/\/$/, "");
+
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-const POSTHOG_API_HOST = (process.env.POSTHOG_API_HOST || "https://us.i.posthog.com").replace(/\/$/, "");
-const IP_RATE_LIMIT = Math.max(20, Number(process.env.IP_RATE_LIMIT || 120));
-const IP_RATE_WINDOW_SECONDS = Math.max(60, Number(process.env.IP_RATE_WINDOW_SECONDS || 300));
-const IP_BLOCK_SECONDS = Math.max(60, Number(process.env.IP_BLOCK_SECONDS || 3600));
+
+const IP_RATE_LIMIT = Math.max(
+  20,
+  Number(process.env.IP_RATE_LIMIT || 120)
+);
+
+const IP_RATE_WINDOW_SECONDS = Math.max(
+  60,
+  Number(process.env.IP_RATE_WINDOW_SECONDS || 300)
+);
+
+const IP_BLOCK_SECONDS = Math.max(
+  60,
+  Number(process.env.IP_BLOCK_SECONDS || 3600)
+);
+
 
 function getClientIp(req) {
   // Vercel が付与する接続元IPを優先。クライアントのJSON本文からIPを受け取らない。
