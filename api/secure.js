@@ -259,7 +259,8 @@ module.exports = async (req, res) => {
     const payload = body.payload || {};
     switch (action) {
       case "limited-post-list": {
-        if (!user.verified && !admin) return json(res, 200, { ok: true, posts: [] });
+        const isVerified = user.verified === true || user.verified === 1 || String(user.verified).toLowerCase() === "true";
+        if (!isVerified && !admin) return json(res, 200, { ok: true, posts: [] });
         const { data, error } = await db.from("posts").select("id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at").eq("is_limited", true).order("created_at", { ascending: false }).limit(50);
         if (error) throw error;
         return json(res, 200, { ok: true, posts: data || [] });
@@ -270,7 +271,8 @@ module.exports = async (req, res) => {
         const { data: post, error } = await db.from("posts").select("id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at").eq("id", postId).maybeSingle();
         if (error) throw error;
         if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
-        if (post.is_limited && !user.verified && !admin) throw Object.assign(new Error("この限定投稿は認証済みユーザーのみ閲覧できます"), { status: 403 });
+        const isVerified = user.verified === true || user.verified === 1 || String(user.verified).toLowerCase() === "true";
+        if (post.is_limited && !isVerified && !admin) throw Object.assign(new Error("この限定投稿は認証済みユーザーのみ閲覧できます"), { status: 403 });
         return json(res, 200, { ok: true, post });
       }
       case "reply-list": {
@@ -279,7 +281,8 @@ module.exports = async (req, res) => {
         const { data: post, error: postError } = await db.from("posts").select("id,user_id,is_limited").eq("id", postId).maybeSingle();
         if (postError) throw postError;
         if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
-        if (post.is_limited && !user.verified && !admin) throw Object.assign(new Error("この限定投稿の返信は閲覧できません"), { status: 403 });
+        const isVerified = user.verified === true || user.verified === 1 || String(user.verified).toLowerCase() === "true";
+        if (post.is_limited && !isVerified && !admin) throw Object.assign(new Error("この限定投稿の返信は閲覧できません"), { status: 403 });
         const { data, error } = await db.from("replies").select("id,post_id,user_id,content,parent_reply_id,created_at").eq("post_id", postId).order("created_at", { ascending: true }).limit(1000);
         if (error) throw error;
         return json(res, 200, { ok: true, replies: data || [] });
