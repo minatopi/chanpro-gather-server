@@ -258,6 +258,46 @@ module.exports = async (req, res) => {
     const admin = ["admin", "developer"].includes(user.role);
     const payload = body.payload || {};
     switch (action) {
+      case "limited-post-list": {
+        if (!user.verified && !admin) return json(res, 200, { ok: true, posts: [] });
+        const { data, error } = await db.from("posts").select("id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at").eq("is_limited", true).order("created_at", { ascending: false }).limit(50);
+        if (error) throw error;
+        return json(res, 200, { ok: true, posts: data || [] });
+      }
+      case "post-read": {
+        const postId = String(payload.postId || "");
+        if (!postId) throw Object.assign(new Error("投稿IDがありません"), { status: 400 });
+        const { data: post, error } = await db.from("posts").select("id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at").eq("id", postId).maybeSingle();
+        if (error) throw error;
+        if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
+        if (post.is_limited && !user.verified && !admin) throw Object.assign(new Error("この限定投稿は認証済みユーザーのみ閲覧できます"), { status: 403 });
+        return json(res, 200, { ok: true, post });
+      }
+      case "reply-list": {
+        const postId = String(payload.postId || "");
+        if (!postId) throw Object.assign(new Error("投稿IDがありません"), { status: 400 });
+        const { data: post, error: postError } = await db.from("posts").select("id,user_id,is_limited").eq("id", postId).maybeSingle();
+        if (postError) throw postError;
+        if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
+        if (post.is_limited && !user.verified && !admin) throw Object.assign(new Error("この限定投稿の返信は閲覧できません"), { status: 403 });
+        const { data, error } = await db.from("replies").select("id,post_id,user_id,content,parent_reply_id,created_at").eq("post_id", postId).order("created_at", { ascending: true }).limit(1000);
+        if (error) throw error;
+        return json(res, 200, { ok: true, replies: data || [] });
+      }
+      case "reply-delete": {
+        const replyId = String(payload.replyId || "");
+        if (!replyId) throw Object.assign(new Error("返信IDがありません"), { status: 400 });
+        const { data: reply, error: readError } = await db.from("replies").select("id,user_id,post_id").eq("id", replyId).maybeSingle();
+        if (readError) throw readError;
+        if (!reply) throw Object.assign(new Error("返信が見つかりません"), { status: 404 });
+        const { data: parentPost, error: parentError } = await db.from("posts").select("id,user_id,is_limited").eq("id", reply.post_id).maybeSingle();
+        if (parentError) throw parentError;
+        if (reply.user_id !== user.id && !admin) throw Object.assign(new Error("この返信を削除する権限がありません"), { status: 403 });
+        if (parentPost?.is_limited && !user.verified && !admin) throw Object.assign(new Error("この限定投稿の返信を削除できません"), { status: 403 });
+        const { error } = await db.from("replies").delete().eq("id", replyId);
+        if (error) throw error;
+        return json(res, 200, { ok: true });
+      }
       case "post-create": {
         const content = String(payload.content || "");
         const imageUrl = payload.image_url == null ? null : String(payload.image_url);
@@ -501,7 +541,22 @@ module.exports = async (req, res) => {
         if (!admin) throw Object.assign(new Error("管理者権限が必要です"), { status: 403 });
         const targetId = String(payload.targetUserId || "");
         const patch = {};
-        for (const key of ["role", "verified", "ban_until", "ban_count", "points"]) if (Object.prototype.hasOwnProperty.call(payload, key)) patch[key] = payload[key];
+        if (Object.prototype.hasOwnProperty.call(payload, "role")) {
+          const role = String(payload.role);
+          if (!["user", "admin", "developer"].includes(role)) throw Object.assign(new Error("ロールが不正です"), { status: 400 });
+          if (role === "developer" && user.role !== "developer") throw Object.assign(new Error("developer権限の付与はdeveloperのみ可能です"), { status: 403 });
+          patch.role = role;
+        }
+        if (Object.prototype.hasOwnProperty.call(payload, "verified")) {
+          if (typeof payload.verified !== "boolean") throw Object.assign(new Error("認証状態が不正です"), { status: 400 });
+          patch.verified = payload.verified;
+        }
+        for (const key of ["ban_until", "ban_count", "points"]) if (Object.prototype.hasOwnProperty.call(payload, key)) patch[key] = payload[key];
+        if (Object.prototype.hasOwnProperty.call(payload, "newPassword")) {
+          const password = String(payload.newPassword || "");
+          if (password.length < 8) throw Object.assign(new Error("パスワードは8文字以上にしてください"), { status: 400 });
+          patch.password_hash = sha256(password);
+        }
         if (!targetId || !Object.keys(patch).length) throw Object.assign(new Error("変更内容を確認してください"), { status: 400 });
         const { error } = await db.from("users").update(patch).eq("id", targetId);
         if (error) throw error;
