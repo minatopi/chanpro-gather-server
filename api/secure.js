@@ -79,6 +79,17 @@ async function sendPostHogSecurityEvent(event, ip, props = {}) {
     console.warn("PostHog security event could not be sent:", e?.message || e);
   }
 }
+// [管理サイト連携] 端末BAN(banned_ip_addresses に "device:<hash>" で保存)
+async function checkDeviceBan(db, deviceHash, ip, action) {
+  if (!/^[a-f0-9]{32,128}$/i.test(String(deviceHash || ""))) return;
+  const key = "device:" + String(deviceHash).toLowerCase();
+  const { data, error } = await db.from("banned_ip_addresses").select("reason,expires_at").eq("ip_hash", key).maybeSingle();
+  if (error) throw error;
+  if (data && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now())) {
+    await axiomLog("device_banned_request", ip, { action, device_hash: String(deviceHash).slice(0, 16), reason: data.reason || "DEVICE BAN" });
+    throw Object.assign(new Error("この端末からのアクセスは禁止されています"), { status: 403 });
+  }
+}
 async function checkIpBan(db, ipHash, ip, action) {
   const { data, error } = await db.from("banned_ip_addresses")
     .select("reason,expires_at").eq("ip_hash", ipHash).maybeSingle();
@@ -241,6 +252,7 @@ module.exports = async (req, res) => {
           await axiomLog("register_blocked", ip, { ip_hash: ipHash, username });
           throw Object.assign(new Error(await settingMessage(db, "register_disabled_message", "現在新規作成を停止しています")), { status: 503 });
         }
+        await checkDeviceBan(db, deviceHash, ip, action);
         if (username.length < 2 || password.length < 8) throw Object.assign(new Error("ユーザー名は2文字以上、パスワードは8文字以上にしてください"), { status: 400 });
         const { data, error } = await db.rpc("register_account_limited", {
           p_username: username,
@@ -277,6 +289,7 @@ module.exports = async (req, res) => {
         await axiomLog("login_failed", ip, { ip_hash: ipHash, username, status: e.status || 500 });
         throw e;
       }
+      if (!["admin", "developer"].includes(user.role)) await checkDeviceBan(db, deviceHash, ip, action);
       // [管理サイト連携] ログイン停止(admin / developer は除外)
       if (!["admin", "developer"].includes(user.role) && !(await isEnabled(db, "login_enabled"))) {
         await axiomLog("login_blocked", ip, { ip_hash: ipHash, username, user_id: String(user.id) });
