@@ -51,9 +51,14 @@ function getClientIp(req) {
   }
   return ip;
 }
+function normalizeIp(ip) {
+  let value = String(ip || "").trim().toLowerCase();
+  if (value.startsWith("::ffff:")) value = value.slice(7);
+  return value;
+}
 function hashIp(ip) {
   if (!IP_HASH_SECRET) throw Object.assign(new Error("IP_HASH_SECRET が未設定です"), { status: 503 });
-  return sha256(IP_HASH_SECRET + ":" + String(ip).trim().toLowerCase());
+  return sha256(IP_HASH_SECRET + ":" + normalizeIp(ip));
 }
 async function sendPostHogSecurityEvent(event, ip, props = {}) {
   if (!POSTHOG_PROJECT_KEY || typeof fetch !== "function") return;
@@ -77,17 +82,6 @@ async function sendPostHogSecurityEvent(event, ip, props = {}) {
   } catch (e) {
     // Analytics outage must not disable authentication or rate limiting.
     console.warn("PostHog security event could not be sent:", e?.message || e);
-  }
-}
-// [管理サイト連携] 端末BAN(banned_ip_addresses に "device:<hash>" で保存)
-async function checkDeviceBan(db, deviceHash, ip, action) {
-  if (!/^[a-f0-9]{32,128}$/i.test(String(deviceHash || ""))) return;
-  const key = "device:" + String(deviceHash).toLowerCase();
-  const { data, error } = await db.from("banned_ip_addresses").select("reason,expires_at").eq("ip_hash", key).maybeSingle();
-  if (error) throw error;
-  if (data && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now())) {
-    await axiomLog("device_banned_request", ip, { action, device_hash: String(deviceHash).slice(0, 16), reason: data.reason || "DEVICE BAN" });
-    throw Object.assign(new Error("この端末からのアクセスは禁止されています"), { status: 403 });
   }
 }
 async function checkIpBan(db, ipHash, ip, action) {
@@ -252,7 +246,6 @@ module.exports = async (req, res) => {
           await axiomLog("register_blocked", ip, { ip_hash: ipHash, username });
           throw Object.assign(new Error(await settingMessage(db, "register_disabled_message", "現在新規作成を停止しています")), { status: 503 });
         }
-        await checkDeviceBan(db, deviceHash, ip, action);
         if (username.length < 2 || password.length < 8) throw Object.assign(new Error("ユーザー名は2文字以上、パスワードは8文字以上にしてください"), { status: 400 });
         const { data, error } = await db.rpc("register_account_limited", {
           p_username: username,
@@ -289,7 +282,6 @@ module.exports = async (req, res) => {
         await axiomLog("login_failed", ip, { ip_hash: ipHash, username, status: e.status || 500 });
         throw e;
       }
-      if (!["admin", "developer"].includes(user.role)) await checkDeviceBan(db, deviceHash, ip, action);
       // [管理サイト連携] ログイン停止(admin / developer は除外)
       if (!["admin", "developer"].includes(user.role) && !(await isEnabled(db, "login_enabled"))) {
         await axiomLog("login_blocked", ip, { ip_hash: ipHash, username, user_id: String(user.id) });
@@ -358,6 +350,33 @@ module.exports = async (req, res) => {
         const { error } = await db.from("replies").delete().eq("id", replyId);
         if (error) throw error;
         return json(res, 200, { ok: true });
+      }
+      case "post-like-toggle": {
+        const postId = String(payload.postId || "");
+        if (!postId) throw Object.assign(new Error("投稿IDがありません"), { status: 400 });
+        const { data: post, error: postError } = await db.from("posts").select("id,user_id,is_limited").eq("id", postId).maybeSingle();
+        if (postError) throw postError;
+        if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
+        if (post.is_limited && !user.verified && !admin && post.user_id !== user.id) {
+          throw Object.assign(new Error("この限定投稿にはいいねできません"), { status: 403 });
+        }
+        const { data: existing, error: findError } = await db.from("likes").select("id").eq("post_id", postId).eq("user_id", user.id).maybeSingle();
+        if (findError) throw findError;
+        let liked;
+        if (existing) {
+          const { error } = await db.from("likes").delete().eq("id", existing.id).eq("user_id", user.id);
+          if (error) throw error;
+          liked = false;
+        } else {
+          const { error } = await db.from("likes").insert({ post_id: postId, user_id: user.id });
+          if (error) {
+            if (error.code === "23505") liked = true;
+            else throw error;
+          } else liked = true;
+        }
+        const { count, error: countError } = await db.from("likes").select("id", { count: "exact", head: true }).eq("post_id", postId);
+        if (countError) throw countError;
+        return json(res, 200, { ok: true, liked, count: Number(count || 0) });
       }
       case "post-create": {
         const content = String(payload.content || "");
