@@ -14,7 +14,7 @@ const IP_BLOCK_SECONDS = Math.max(60, Number(process.env.IP_BLOCK_SECONDS || 360
 
 // ハッシュタグ(hashtagsテーブル)をサーバーで加算する場合のみ 1 にする。
 // DBトリガー等で既に集計している場合は 0(未設定)のままにして二重加算を避ける。
-const SERVER_COUNT_HASHTAGS = process.env.SERVER_COUNT_HASHTAGS === "1";
+const SERVER_COUNT_HASHTAGS = false;
 const STICKERS_URL = process.env.STICKERS_URL || "https://minatopi.github.io/chanpro-chat-edit/stickers.json";
 
 // ---- [管理サイト連携] Axiom ログ & 停止設定 ----
