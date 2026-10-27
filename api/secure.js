@@ -12,6 +12,11 @@ const IP_RATE_LIMIT = Math.max(20, Number(process.env.IP_RATE_LIMIT || 120));
 const IP_RATE_WINDOW_SECONDS = Math.max(60, Number(process.env.IP_RATE_WINDOW_SECONDS || 300));
 const IP_BLOCK_SECONDS = Math.max(60, Number(process.env.IP_BLOCK_SECONDS || 3600));
 
+// ハッシュタグ(hashtagsテーブル)をサーバーで加算する場合のみ 1 にする。
+// DBトリガー等で既に集計している場合は 0(未設定)のままにして二重加算を避ける。
+const SERVER_COUNT_HASHTAGS = process.env.SERVER_COUNT_HASHTAGS === "1";
+const STICKERS_URL = process.env.STICKERS_URL || "https://minatopi.github.io/chanpro-chat-edit/stickers.json";
+
 // ---- [管理サイト連携] Axiom ログ & 停止設定 ----
 const AXIOM_TOKEN = process.env.AXIOM_TOKEN || "";
 const AXIOM_DATASET = process.env.AXIOM_DATASET || "chanpro";
@@ -39,6 +44,9 @@ async function settingMessage(db, key, fallback) {
 }
 // ------------------------------------------------
 
+function fail(message, status = 400) {
+  return Object.assign(new Error(message), { status });
+}
 function getClientIp(req) {
   // Vercel が付与する接続元IPを優先。クライアントのJSON本文からIPを受け取らない。
   const real = req.headers["x-real-ip"];
@@ -47,7 +55,7 @@ function getClientIp(req) {
     (Array.isArray(forwarded) ? forwarded[0] : String(forwarded || "").split(",")[0]);
   const ip = String(raw || "").trim().replace(/^\[|\]$/g, "");
   if (!ip || ip.length > 100 || !/^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(ip)) {
-    throw Object.assign(new Error("接続元IPを確認できません。Vercelのx-real-ip設定を確認してください"), { status: 503 });
+    throw fail("接続元IPを確認できません。Vercelのx-real-ip設定を確認してください", 503);
   }
   return ip;
 }
@@ -57,7 +65,7 @@ function normalizeIp(ip) {
   return value;
 }
 function hashIp(ip) {
-  if (!IP_HASH_SECRET) throw Object.assign(new Error("IP_HASH_SECRET が未設定です"), { status: 503 });
+  if (!IP_HASH_SECRET) throw fail("IP_HASH_SECRET が未設定です", 503);
   return sha256(IP_HASH_SECRET + ":" + normalizeIp(ip));
 }
 async function sendPostHogSecurityEvent(event, ip, props = {}) {
@@ -91,7 +99,7 @@ async function checkIpBan(db, ipHash, ip, action) {
   if (data && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now())) {
     await sendPostHogSecurityEvent("chanpro_ip_banned_request", ip, { ip_hash: ipHash, action, reason: data.reason || "IP BAN" });
     await axiomLog("ip_banned_request", ip, { ip_hash: ipHash, action, reason: data.reason || "IP BAN" });
-    throw Object.assign(new Error(data.reason || "このIPアドレスからのアクセスは禁止されています"), { status: 403 });
+    throw fail(data.reason || "このIPアドレスからのアクセスは禁止されています", 403);
   }
 }
 
@@ -104,7 +112,7 @@ async function enforceIpRateLimit(db, ipHash) {
   });
   if (error) {
     console.error("IP rate-limit RPC failed:", error.message || error);
-    throw Object.assign(new Error("IP制限の確認に失敗しました。SupabaseのセキュリティSQLを適用してください"), { status: 503 });
+    throw fail("IP制限の確認に失敗しました。SupabaseのセキュリティSQLを適用してください", 503);
   }
   const row = Array.isArray(data) ? data[0] : data;
   if (row?.blocked) {
@@ -126,7 +134,7 @@ function safeEqual(a, b) {
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
 function signSession(user) {
-  if (!SESSION_SECRET) throw Object.assign(new Error("SESSION_SECRET が未設定です"), { status: 503 });
+  if (!SESSION_SECRET) throw fail("SESSION_SECRET が未設定です", 503);
   const payload = Buffer.from(JSON.stringify({
     sub: String(user.id), username: String(user.username || ""),
     exp: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60,
@@ -138,29 +146,30 @@ function signSession(user) {
 function readSession(req) {
   const header = String(req.headers.authorization || "");
   const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-  if (!token || !SESSION_SECRET) throw Object.assign(new Error("ログイン状態が切れました。再ログインしてください"), { status: 401 });
+  if (!token || !SESSION_SECRET) throw fail("ログイン状態が切れました。再ログインしてください", 401);
   const parts = token.split(".");
-  if (parts.length !== 2) throw Object.assign(new Error("セッションが無効です"), { status: 401 });
+  if (parts.length !== 2) throw fail("セッションが無効です", 401);
   const expected = crypto.createHmac("sha256", SESSION_SECRET).update(parts[0]).digest("base64url");
-  if (!safeEqual(expected, parts[1])) throw Object.assign(new Error("セッションが無効です"), { status: 401 });
+  if (!safeEqual(expected, parts[1])) throw fail("セッションが無効です", 401);
   let data;
   try { data = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")); } catch (_) {
-    throw Object.assign(new Error("セッションが無効です"), { status: 401 });
+    throw fail("セッションが無効です", 401);
   }
   if (data.iss !== "chanpro-gather" || !data.sub || Number(data.exp) <= Math.floor(Date.now() / 1000)) {
-    throw Object.assign(new Error("セッションの有効期限が切れました。再ログインしてください"), { status: 401 });
+    throw fail("セッションの有効期限が切れました。再ログインしてください", 401);
   }
   return data;
 }
+
+const USER_COLUMNS = "id,username,password_hash,role,verified,ban_until,ban_count,icon_url,cover_url,profile,settings,program_urls,program_views,program_likes,profile_music,points,stamp_list,login_streak,last_login_date,consecutive_post_weeks,last_post_week";
+
 async function authenticateSession(db, req) {
   const session = readSession(req);
-  const { data: user, error } = await db.from("users")
-    .select("id,username,password_hash,role,verified,ban_until,icon_url,cover_url,profile,settings,program_urls,program_views,program_likes,profile_music,points,stamp_list,login_streak,last_login_date")
-    .eq("id", session.sub).maybeSingle();
+  const { data: user, error } = await db.from("users").select(USER_COLUMNS).eq("id", session.sub).maybeSingle();
   if (error) throw error;
-  if (!user) throw Object.assign(new Error("ユーザーが見つかりません。再ログインしてください"), { status: 401 });
+  if (!user) throw fail("ユーザーが見つかりません。再ログインしてください", 401);
   if (user.ban_until && new Date(user.ban_until).getTime() > Date.now()) {
-    throw Object.assign(new Error("このアカウントはBANされています"), { status: 403 });
+    throw fail("このアカウントはBANされています", 403);
   }
   delete user.password_hash;
   return { user };
@@ -174,21 +183,19 @@ function client(req) {
 function credentials(body) {
   const username = String(body.username || "").trim();
   const password = String(body.password || "");
-  if (!username || !password) throw Object.assign(new Error("ユーザー名とパスワードを入力してください"), { status: 400 });
-  if (username.length > 100 || password.length > 1024) throw Object.assign(new Error("入力が長すぎます"), { status: 400 });
+  if (!username || !password) throw fail("ユーザー名とパスワードを入力してください", 400);
+  if (username.length > 100 || password.length > 1024) throw fail("入力が長すぎます", 400);
   return { username, password };
 }
 async function authenticate(db, body, { allowBanned = false } = {}) {
   const { username, password } = credentials(body);
-  const { data: user, error } = await db.from("users")
-    .select("id,username,password_hash,role,verified,ban_until,icon_url,cover_url,profile,settings,program_urls,program_views,program_likes,profile_music,points,stamp_list,login_streak,last_login_date")
-    .eq("username", username).maybeSingle();
+  const { data: user, error } = await db.from("users").select(USER_COLUMNS).eq("username", username).maybeSingle();
   if (error) throw error;
   if (!user || !safeEqual(user.password_hash, sha256(password))) {
-    throw Object.assign(new Error("ユーザー名またはパスワードが違います"), { status: 401 });
+    throw fail("ユーザー名またはパスワードが違います", 401);
   }
   if (!allowBanned && user.ban_until && new Date(user.ban_until).getTime() > Date.now()) {
-    throw Object.assign(new Error("このアカウントはBANされています"), { status: 403 });
+    throw fail("このアカウントはBANされています", 403);
   }
   return { user, password };
 }
@@ -201,9 +208,115 @@ const settingFields = [
   "home_chat_width", "post_notification_sound_enabled"
 ];
 
+// ================= 共通ヘルパー =================
+const SAFE_ID = /^[A-Za-z0-9_-]{1,64}$/;
+function requireId(value, message = "IDが不正です") {
+  const s = String(value == null ? "" : value);
+  if (!SAFE_ID.test(s)) throw fail(message, 400);
+  return s;
+}
+function canAccessPost(post, user, admin) {
+  return !post.is_limited || admin || !!user.verified || String(post.user_id) === String(user.id);
+}
+async function loadAccessiblePost(db, postId, user, admin, message = "この投稿は操作できません") {
+  const id = requireId(postId, "投稿IDがありません");
+  const { data: post, error } = await db.from("posts").select("id,user_id,is_limited,poll").eq("id", id).maybeSingle();
+  if (error) throw error;
+  if (!post) throw fail("投稿が見つかりません", 404);
+  if (!canAccessPost(post, user, admin)) throw fail(message, 403);
+  return post;
+}
+function chunk(list, size) {
+  const out = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
+}
+
+// 通知の整理: 30日より古い通知と、新しい順で100件を超える通知を削除
+async function trimNotifications(db, userId) {
+  try {
+    const cutoff = new Date(Date.now() - 30 * 86400000).toISOString();
+    await db.from("notifications").delete().eq("user_id", userId).lt("created_at", cutoff);
+    const { data } = await db.from("notifications").select("id").eq("user_id", userId)
+      .order("created_at", { ascending: false }).range(100, 599);
+    if (data?.length) await db.from("notifications").delete().in("id", data.map(r => r.id));
+  } catch (e) {
+    console.warn("notification trim failed:", e?.message || e);
+  }
+}
+// 通知の作成(自分宛は除外。dedupe=true なら同じ actor/type/post の通知が既にあれば作らない)
+async function addNotifications(db, rows, { dedupe = false, allowSelf = false } = {}) {
+  try {
+    rows = (rows || []).filter(r => r && r.user_id && (allowSelf || String(r.user_id) !== String(r.actor_id)));
+    if (!rows.length) return;
+    if (dedupe) {
+      const kept = [];
+      for (const r of rows) {
+        let q = db.from("notifications").select("id").eq("user_id", r.user_id).eq("actor_id", r.actor_id).eq("type", r.type).limit(1);
+        q = r.post_id ? q.eq("post_id", r.post_id) : q.is("post_id", null);
+        const { data } = await q;
+        if (!data?.length) kept.push(r);
+      }
+      rows = kept;
+      if (!rows.length) return;
+    }
+    for (const part of chunk(rows, 500)) {
+      const { error } = await db.from("notifications").insert(part);
+      if (error) console.warn("notification insert failed:", error.message);
+    }
+    for (const uid of [...new Set(rows.map(r => r.user_id))].slice(0, 20)) await trimNotifications(db, uid);
+  } catch (e) {
+    console.warn("addNotifications failed:", e?.message || e);
+  }
+}
+
+function normalizePoll(poll) {
+  if (poll == null) return null;
+  if (typeof poll !== "object" || Array.isArray(poll)) throw fail("アンケートの形式が不正です", 400);
+  const question = String(poll.question || "").trim().slice(0, 200);
+  const options = (Array.isArray(poll.options) ? poll.options : []).map(o => String(o || "").trim().slice(0, 100)).filter(Boolean);
+  if (!question) throw fail("アンケートの質問を入力してください", 400);
+  if (options.length < 2 || options.length > 4) throw fail("選択肢は2〜4個にしてください", 400);
+  if (new Set(options).size !== options.length) throw fail("選択肢は重複させないでください", 400);
+  return { question, options };
+}
+
+async function countHashtags(db, content) {
+  if (!SERVER_COUNT_HASHTAGS) return;
+  try {
+    const text = String(content || "").replace(/```html\s*\n[\s\S]*?\n```/gi, "");
+    const tags = [...new Set((text.match(/#[\p{L}\p{N}_]+/gu) || []).map(t => t.slice(1).toLowerCase()))].slice(0, 10);
+    for (const tag of tags) {
+      const { data } = await db.from("hashtags").select("usage_count").eq("tag", tag).maybeSingle();
+      await db.from("hashtags").upsert({ tag, usage_count: Number(data?.usage_count || 0) + 1, updated_at: new Date().toISOString() }, { onConflict: "tag" });
+    }
+  } catch (e) {
+    console.warn("hashtag count failed:", e?.message || e);
+  }
+}
+
+let stickerCache = { at: 0, map: null };
+async function getStickerPrice(stampUrl) {
+  if (!stickerCache.map || Date.now() - stickerCache.at > 5 * 60000) {
+    const res = await fetch(STICKERS_URL, { signal: AbortSignal.timeout(4000), cache: "no-store" });
+    if (!res.ok) throw fail("スタンプ情報を取得できませんでした", 503);
+    const list = await res.json();
+    const map = new Map();
+    for (const s of Array.isArray(list) ? list : []) if (s?.url) map.set(String(s.url), Number(s.price || 0));
+    stickerCache = { at: Date.now(), map };
+  }
+  return stickerCache.map.has(stampUrl) ? stickerCache.map.get(stampUrl) : null;
+}
+
+// points を楽観ロックで更新(同時更新による二重消費・巻き戻しを防ぐ)
+async function updatePointsCas(db, userId, oldPoints, patch) {
+  const { data, error } = await db.from("users").update(patch).eq("id", userId).eq("points", Number(oldPoints || 0)).select("id");
+  if (error) throw error;
+  if (!data?.length) throw fail("ポイントが同時に更新されました。もう一度お試しください", 409);
+}
+
 module.exports = async (req, res) => {
-  // User requested unrestricted CORS. This permits browser requests from any origin,
-  // including file:// (Origin: null). Authentication/authorization must still be enforced below.
+  // User requested unrestricted CORS. Authentication/authorization is enforced below.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, apikey, x-client-info");
@@ -235,7 +348,7 @@ module.exports = async (req, res) => {
       const { username, password } = credentials(body);
       const deviceHash = String(body.deviceHash || "").trim();
       if (action === "register" && !/^[a-f0-9]{32,128}$/i.test(deviceHash)) {
-        throw Object.assign(new Error("端末情報を確認できません。通常のブラウザで再試行してください"), { status: 400 });
+        throw fail("端末情報を確認できません。通常のブラウザで再試行してください", 400);
       }
       await sendPostHogSecurityEvent(action === "register" ? "chanpro_registration_attempt" : "chanpro_login_attempt", ip, {
         ip_hash: ipHash, action, username, device_hash: deviceHash || undefined
@@ -244,9 +357,9 @@ module.exports = async (req, res) => {
         // [管理サイト連携] 新規作成停止
         if (!(await isEnabled(db, "register_enabled"))) {
           await axiomLog("register_blocked", ip, { ip_hash: ipHash, username });
-          throw Object.assign(new Error(await settingMessage(db, "register_disabled_message", "現在新規作成を停止しています")), { status: 503 });
+          throw fail(await settingMessage(db, "register_disabled_message", "現在新規作成を停止しています"), 503);
         }
-        if (username.length < 2 || password.length < 8) throw Object.assign(new Error("ユーザー名は2文字以上、パスワードは8文字以上にしてください"), { status: 400 });
+        if (username.length < 2 || password.length < 8) throw fail("ユーザー名は2文字以上、パスワードは8文字以上にしてください", 400);
         const { data, error } = await db.rpc("register_account_limited", {
           p_username: username,
           p_password_hash: sha256(password),
@@ -255,9 +368,9 @@ module.exports = async (req, res) => {
         });
         if (error) {
           if (/DEVICE_ACCOUNT_LIMIT/.test(error.message || "")) {
-            throw Object.assign(new Error("この端末で作成できる新規アカウントは5個までです"), { status: 429 });
+            throw fail("この端末で作成できる新規アカウントは5個までです", 429);
           }
-          if (error.code === "23505") throw Object.assign(new Error("そのユーザー名は既に使用されています"), { status: 409 });
+          if (error.code === "23505") throw fail("そのユーザー名は既に使用されています", 409);
           throw error;
         }
         const user = data && typeof data === "object" ? data : null;
@@ -285,7 +398,7 @@ module.exports = async (req, res) => {
       // [管理サイト連携] ログイン停止(admin / developer は除外)
       if (!["admin", "developer"].includes(user.role) && !(await isEnabled(db, "login_enabled"))) {
         await axiomLog("login_blocked", ip, { ip_hash: ipHash, username, user_id: String(user.id) });
-        throw Object.assign(new Error(await settingMessage(db, "login_disabled_message", "現在ログインを停止しています")), { status: 503 });
+        throw fail(await settingMessage(db, "login_disabled_message", "現在ログインを停止しています"), 503);
       }
       if (deviceHash) {
         const { error } = await db.from("user_devices").upsert({
@@ -311,6 +424,7 @@ module.exports = async (req, res) => {
       user_id: String(user.id), username: String(user.username || "")
     });
     switch (action) {
+      // ---------------- 投稿の読み取り ----------------
       case "limited-post-list": {
         if (!user.verified && !admin) return json(res, 200, { ok: true, posts: [] });
         const { data, error } = await db.from("posts").select("id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at").eq("is_limited", true).order("created_at", { ascending: false }).limit(50);
@@ -318,49 +432,134 @@ module.exports = async (req, res) => {
         return json(res, 200, { ok: true, posts: data || [] });
       }
       case "post-read": {
-        const postId = String(payload.postId || "");
-        if (!postId) throw Object.assign(new Error("投稿IDがありません"), { status: 400 });
+        const postId = requireId(payload.postId, "投稿IDがありません");
         const { data: post, error } = await db.from("posts").select("id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at").eq("id", postId).maybeSingle();
         if (error) throw error;
-        if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
-        if (post.is_limited && !user.verified && !admin) throw Object.assign(new Error("この限定投稿は認証済みユーザーのみ閲覧できます"), { status: 403 });
+        if (!post) throw fail("投稿が見つかりません", 404);
+        if (post.is_limited && !user.verified && !admin) throw fail("この限定投稿は認証済みユーザーのみ閲覧できます", 403);
         return json(res, 200, { ok: true, post });
       }
       case "reply-list": {
-        const postId = String(payload.postId || "");
-        if (!postId) throw Object.assign(new Error("投稿IDがありません"), { status: 400 });
+        const postId = requireId(payload.postId, "投稿IDがありません");
         const { data: post, error: postError } = await db.from("posts").select("id,user_id,is_limited").eq("id", postId).maybeSingle();
         if (postError) throw postError;
-        if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
-        if (post.is_limited && !user.verified && !admin) throw Object.assign(new Error("この限定投稿の返信は閲覧できません"), { status: 403 });
+        if (!post) throw fail("投稿が見つかりません", 404);
+        if (post.is_limited && !user.verified && !admin) throw fail("この限定投稿の返信は閲覧できません", 403);
         const { data, error } = await db.from("replies").select("id,post_id,user_id,content,parent_reply_id,created_at").eq("post_id", postId).order("created_at", { ascending: true }).limit(1000);
         if (error) throw error;
         return json(res, 200, { ok: true, replies: data || [] });
       }
+
+      // ---------------- 投稿・返信の書き込み ----------------
+      case "post-create": {
+        const content = String(payload.content || "");
+        const imageUrl = payload.image_url == null ? null : String(payload.image_url);
+        const quotePostId = payload.quote_post_id == null ? null : requireId(payload.quote_post_id, "引用元の投稿IDが不正です");
+        const poll = normalizePoll(payload.poll);
+        if (!content.trim() && !imageUrl && !quotePostId && !poll) throw fail("投稿内容を入力してください", 400);
+        if (content.length > 100000) throw fail("投稿内容が長すぎます", 400);
+        if (imageUrl && imageUrl.length > 10000) throw fail("画像URLが長すぎます", 400);
+        if (quotePostId) await loadAccessiblePost(db, quotePostId, user, admin, "この投稿は引用できません");
+        const isLimited = !!payload.is_limited && !!user.verified;
+        const row = { user_id: user.id, content, image_url: imageUrl, is_limited: isLimited, quote_post_id: quotePostId, poll, views: 0 };
+        const { data, error } = await db.from("posts").insert(row).select("*").single();
+        if (error) throw error;
+        // フォロワーへの通知(失敗しても投稿は成功扱い)
+        try {
+          const { data: follows } = await db.from("follows").select("follower_id").eq("following_id", user.id);
+          let followerIds = [...new Set((follows || []).map(f => f.follower_id).filter(id => id && String(id) !== String(user.id)))];
+          if (isLimited && followerIds.length) {
+            const ok = [];
+            for (const part of chunk(followerIds, 200)) {
+              const { data: vs } = await db.from("users").select("id").in("id", part).eq("verified", true);
+              ok.push(...(vs || []).map(v => v.id));
+            }
+            followerIds = ok;
+          }
+          await addNotifications(db, followerIds.map(uid => ({ user_id: uid, actor_id: user.id, type: "post", post_id: data.id })));
+        } catch (e) {
+          console.warn("post notify failed:", e?.message || e);
+        }
+        await countHashtags(db, content);
+        return json(res, 200, { ok: true, post: data, notifiedFollowers: true });
+      }
+      case "reply-create": {
+        const postId = requireId(payload.post_id, "返信先の投稿IDがありません");
+        const content = String(payload.content || "").trim();
+        const parentReplyId = payload.parent_reply_id == null ? null : requireId(payload.parent_reply_id, "返信先が不正です");
+        if (!content) throw fail("返信内容を入力してください", 400);
+        if (content.length > 20000) throw fail("返信内容が長すぎます", 400);
+        const { data: post, error: postError } = await db.from("posts").select("id,user_id,is_limited").eq("id", postId).maybeSingle();
+        if (postError) throw postError;
+        if (!post) throw fail("返信先の投稿が見つかりません", 404);
+        if (post.is_limited && post.user_id !== user.id && !admin) throw fail("この限定投稿には返信できません", 403);
+        let parentAuthor = null;
+        if (parentReplyId) {
+          const { data: parent, error: parentError } = await db.from("replies").select("id,post_id,user_id").eq("id", parentReplyId).maybeSingle();
+          if (parentError) throw parentError;
+          if (!parent || String(parent.post_id) !== postId) throw fail("返信先が見つかりません", 400);
+          parentAuthor = parent.user_id;
+        }
+        const row = { post_id: postId, user_id: user.id, content, parent_reply_id: parentReplyId };
+        const { data, error } = await db.from("replies").insert(row).select("id,post_id,user_id,content,parent_reply_id,created_at").single();
+        if (error) throw error;
+        const targets = [...new Set([parentAuthor || post.user_id])];
+        await addNotifications(db, targets.map(uid => ({ user_id: uid, actor_id: user.id, type: "reply", post_id: postId })));
+        return json(res, 200, { ok: true, reply: data });
+      }
       case "reply-delete": {
-        const replyId = String(payload.replyId || "");
-        if (!replyId) throw Object.assign(new Error("返信IDがありません"), { status: 400 });
+        const replyId = requireId(payload.replyId, "返信IDがありません");
         const { data: reply, error: readError } = await db.from("replies").select("id,user_id,post_id").eq("id", replyId).maybeSingle();
         if (readError) throw readError;
-        if (!reply) throw Object.assign(new Error("返信が見つかりません"), { status: 404 });
+        if (!reply) throw fail("返信が見つかりません", 404);
         const { data: parentPost, error: parentError } = await db.from("posts").select("id,user_id,is_limited").eq("id", reply.post_id).maybeSingle();
         if (parentError) throw parentError;
-        if (reply.user_id !== user.id && !admin) throw Object.assign(new Error("この返信を削除する権限がありません"), { status: 403 });
-        if (parentPost?.is_limited && !user.verified && !admin) throw Object.assign(new Error("この限定投稿の返信を削除できません"), { status: 403 });
+        if (reply.user_id !== user.id && !admin) throw fail("この返信を削除する権限がありません", 403);
+        if (parentPost?.is_limited && !user.verified && !admin) throw fail("この限定投稿の返信を削除できません", 403);
         const { error } = await db.from("replies").delete().eq("id", replyId);
+        if (error) throw error;
+        return json(res, 200, { ok: true, postId: reply.post_id });
+      }
+      case "post-delete": {
+        const postId = requireId(payload.postId, "投稿IDがありません");
+        const { data: post, error: readError } = await db.from("posts").select("id,user_id").eq("id", postId).maybeSingle();
+        if (readError) throw readError;
+        if (!post) throw fail("投稿が見つかりません", 404);
+        if (post.user_id !== user.id && !admin) throw fail("削除権限がありません", 403);
+        const { error } = await db.from("posts").delete().eq("id", post.id);
         if (error) throw error;
         return json(res, 200, { ok: true });
       }
-      case "post-like-toggle": {
-        const postId = String(payload.postId || "");
-        if (!postId) throw Object.assign(new Error("投稿IDがありません"), { status: 400 });
-        const { data: post, error: postError } = await db.from("posts").select("id,user_id,is_limited").eq("id", postId).maybeSingle();
-        if (postError) throw postError;
-        if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
-        if (post.is_limited && !user.verified && !admin && post.user_id !== user.id) {
-          throw Object.assign(new Error("この限定投稿にはいいねできません"), { status: 403 });
+      case "post-view": {
+        const postId = requireId(payload.postId, "投稿IDがありません");
+        const { data: post, error } = await db.from("posts").select("id,user_id,views").eq("id", postId).maybeSingle();
+        if (error) throw error;
+        if (!post) throw fail("投稿が見つかりません", 404);
+        if (post.user_id === user.id) return json(res, 200, { ok: true, views: Number(post.views || 0) });
+        const views = Number(post.views || 0) + 1;
+        const { error: updateError } = await db.from("posts").update({ views }).eq("id", post.id);
+        if (updateError) throw updateError;
+        return json(res, 200, { ok: true, views });
+      }
+      case "post-pin": {
+        const postId = requireId(payload.postId, "投稿IDがありません");
+        const { data: post, error } = await db.from("posts").select("id,user_id").eq("id", postId).maybeSingle();
+        if (error) throw error;
+        if (!post) throw fail("投稿が見つかりません", 404);
+        if (post.user_id !== user.id && !admin) throw fail("権限がありません", 403);
+        if (payload.pinned) {
+          const { error: clearError } = await db.from("posts").update({ is_pinned: false }).eq("user_id", post.user_id).eq("is_pinned", true);
+          if (clearError) throw clearError;
         }
-        const { data: existing, error: findError } = await db.from("likes").select("id").eq("post_id", postId).eq("user_id", user.id).maybeSingle();
+        const { error: updateError } = await db.from("posts").update({ is_pinned: !!payload.pinned }).eq("id", post.id);
+        if (updateError) throw updateError;
+        return json(res, 200, { ok: true, pinned: !!payload.pinned });
+      }
+
+      // ---------------- いいね・リポスト・ブックマーク・投票・フォロー ----------------
+      case "post-like-toggle": {
+        const post = await loadAccessiblePost(db, payload.postId, user, admin, "この限定投稿にはいいねできません");
+        const { data: existing, error: findError } = await db.from("likes").select("id").eq("post_id", post.id).eq("user_id", user.id).maybeSingle();
         if (findError) throw findError;
         let liked;
         if (existing) {
@@ -368,66 +567,170 @@ module.exports = async (req, res) => {
           if (error) throw error;
           liked = false;
         } else {
-          const { error } = await db.from("likes").insert({ post_id: postId, user_id: user.id });
-          if (error) {
-            if (error.code === "23505") liked = true;
-            else throw error;
-          } else liked = true;
+          const { error } = await db.from("likes").insert({ post_id: post.id, user_id: user.id });
+          if (error && error.code !== "23505") throw error;
+          liked = true;
+          await addNotifications(db, [{ user_id: post.user_id, actor_id: user.id, type: "like", post_id: post.id }], { dedupe: true });
         }
-        const { count, error: countError } = await db.from("likes").select("id", { count: "exact", head: true }).eq("post_id", postId);
+        const { count, error: countError } = await db.from("likes").select("id", { count: "exact", head: true }).eq("post_id", post.id);
         if (countError) throw countError;
         return json(res, 200, { ok: true, liked, count: Number(count || 0) });
       }
-      case "post-create": {
-        const content = String(payload.content || "");
-        const imageUrl = payload.image_url == null ? null : String(payload.image_url);
-        const quotePostId = payload.quote_post_id == null ? null : String(payload.quote_post_id);
-        if (!content.trim() && !imageUrl && !quotePostId && !payload.poll) throw Object.assign(new Error("投稿内容を入力してください"), { status: 400 });
-        if (content.length > 100000) throw Object.assign(new Error("投稿内容が長すぎます"), { status: 400 });
-        if (imageUrl && imageUrl.length > 10000) throw Object.assign(new Error("画像URLが長すぎます"), { status: 400 });
-        const isLimited = !!payload.is_limited && !!user.verified;
-        const row = { user_id: user.id, content, image_url: imageUrl, is_limited: isLimited, quote_post_id: quotePostId, poll: payload.poll || null, views: 0 };
-        const { data, error } = await db.from("posts").insert(row).select("*").single();
-        if (error) throw error;
-        return json(res, 200, { ok: true, post: data });
-      }
-      case "reply-create": {
-        const postId = String(payload.post_id || "");
-        const content = String(payload.content || "").trim();
-        const parentReplyId = payload.parent_reply_id == null ? null : String(payload.parent_reply_id);
-        if (!postId || !content) throw Object.assign(new Error("返信内容を入力してください"), { status: 400 });
-        if (content.length > 20000) throw Object.assign(new Error("返信内容が長すぎます"), { status: 400 });
-        const { data: post, error: postError } = await db.from("posts").select("id,user_id,is_limited").eq("id", postId).maybeSingle();
-        if (postError) throw postError;
-        if (!post) throw Object.assign(new Error("返信先の投稿が見つかりません"), { status: 404 });
-        if (post.is_limited && post.user_id !== user.id && !admin) throw Object.assign(new Error("この限定投稿には返信できません"), { status: 403 });
-        if (parentReplyId) {
-          const { data: parent, error: parentError } = await db.from("replies").select("id,post_id").eq("id", parentReplyId).maybeSingle();
-          if (parentError) throw parentError;
-          if (!parent || String(parent.post_id) !== postId) throw Object.assign(new Error("返信先が見つかりません"), { status: 400 });
+      case "repost-toggle": {
+        const post = await loadAccessiblePost(db, payload.postId, user, admin, "この限定投稿はリポストできません");
+        const { data: existing, error: findError } = await db.from("reposts").select("id").eq("post_id", post.id).eq("user_id", user.id).maybeSingle();
+        if (findError) throw findError;
+        let reposted;
+        if (existing) {
+          const { error } = await db.from("reposts").delete().eq("id", existing.id).eq("user_id", user.id);
+          if (error) throw error;
+          reposted = false;
+        } else {
+          const { error } = await db.from("reposts").insert({ post_id: post.id, user_id: user.id });
+          if (error && error.code !== "23505") throw error;
+          reposted = true;
+          await addNotifications(db, [{ user_id: post.user_id, actor_id: user.id, type: "repost", post_id: post.id }], { dedupe: true });
         }
-        const row = { post_id: postId, user_id: user.id, content, parent_reply_id: parentReplyId };
-        const { data, error } = await db.from("replies").insert(row).select("id,post_id,user_id,content,parent_reply_id,created_at").single();
-        if (error) throw error;
-        return json(res, 200, { ok: true, reply: data });
+        const { count, error: countError } = await db.from("reposts").select("id", { count: "exact", head: true }).eq("post_id", post.id);
+        if (countError) throw countError;
+        return json(res, 200, { ok: true, reposted, count: Number(count || 0) });
       }
+      case "bookmark-toggle": {
+        const post = await loadAccessiblePost(db, payload.postId, user, admin, "この限定投稿はブックマークできません");
+        const { data: existing, error: findError } = await db.from("bookmarks").select("id").eq("post_id", post.id).eq("user_id", user.id).maybeSingle();
+        if (findError) throw findError;
+        let bookmarked;
+        if (existing) {
+          const { error } = await db.from("bookmarks").delete().eq("id", existing.id).eq("user_id", user.id);
+          if (error) throw error;
+          bookmarked = false;
+        } else {
+          const { error } = await db.from("bookmarks").insert({ post_id: post.id, user_id: user.id });
+          if (error && error.code !== "23505") throw error;
+          bookmarked = true;
+        }
+        return json(res, 200, { ok: true, bookmarked });
+      }
+      case "poll-vote": {
+        const post = await loadAccessiblePost(db, payload.postId, user, admin, "この限定投稿のアンケートには投票できません");
+        const options = post.poll && Array.isArray(post.poll.options) ? post.poll.options : null;
+        if (!options) throw fail("この投稿にはアンケートがありません", 400);
+        const optionIndex = Number(payload.optionIndex);
+        if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) throw fail("選択肢が不正です", 400);
+        const { data: existing, error: findError } = await db.from("poll_votes").select("id").eq("post_id", post.id).eq("user_id", user.id).maybeSingle();
+        if (findError) throw findError;
+        if (existing) throw fail("すでに投票しています", 409);
+        const { error } = await db.from("poll_votes").insert({ post_id: post.id, user_id: user.id, option_index: optionIndex });
+        if (error) {
+          if (error.code === "23505") throw fail("すでに投票しています", 409);
+          throw error;
+        }
+        await addNotifications(db, [{
+          user_id: post.user_id, actor_id: user.id, type: "poll_voted", post_id: post.id,
+          message: `${user.username || "ユーザー"}さんがあなたのアンケートに投票しました`
+        }]);
+        return json(res, 200, { ok: true, optionIndex });
+      }
+      case "follow-toggle": {
+        const targetId = requireId(payload.targetUserId, "対象ユーザーが不正です");
+        if (targetId === String(user.id)) throw fail("自分はフォローできません", 400);
+        const { data: target, error: targetError } = await db.from("users").select("id").eq("id", targetId).maybeSingle();
+        if (targetError) throw targetError;
+        if (!target) throw fail("ユーザーが見つかりません", 404);
+        const { data: existing, error: findError } = await db.from("follows").select("id").eq("follower_id", user.id).eq("following_id", targetId).maybeSingle();
+        if (findError) throw findError;
+        let following;
+        if (existing) {
+          const { error } = await db.from("follows").delete().eq("id", existing.id).eq("follower_id", user.id);
+          if (error) throw error;
+          following = false;
+        } else {
+          const { error } = await db.from("follows").insert({ follower_id: user.id, following_id: targetId });
+          if (error && error.code !== "23505") throw error;
+          following = true;
+          await addNotifications(db, [{ user_id: target.id, actor_id: user.id, type: "follow" }], { dedupe: true });
+        }
+        return json(res, 200, { ok: true, following });
+      }
+
+      // ---------------- 通知・通報 ----------------
+      case "notifications-read": {
+        const { error } = await db.from("notifications").update({ is_read: true }).eq("user_id", user.id).eq("is_read", false);
+        if (error) throw error;
+        await trimNotifications(db, user.id);
+        return json(res, 200, { ok: true });
+      }
+      case "report-create": {
+        const targetId = requireId(payload.targetUserId, "通報対象が不正です");
+        const postId = payload.postId == null || payload.postId === "" ? null : requireId(payload.postId, "投稿IDが不正です");
+        const reason = String(payload.reason || "").trim();
+        if (!reason) throw fail("通報理由を入力してください", 400);
+        if (reason.length > 2000) throw fail("通報理由が長すぎます", 400);
+        if (targetId === String(user.id)) throw fail("自分自身は通報できません", 400);
+        const since = new Date(Date.now() - 5 * 60000).toISOString();
+        let dup = db.from("reports").select("id").eq("reporter_id", user.id).eq("target_user_id", targetId).gte("created_at", since).limit(1);
+        dup = postId ? dup.eq("post_id", postId) : dup.is("post_id", null);
+        const { data: recent } = await dup;
+        if (recent?.length) throw fail("同じ内容を短時間に繰り返し通報することはできません", 429);
+        const { error } = await db.from("reports").insert({ reporter_id: user.id, target_user_id: targetId, post_id: postId, reason });
+        if (error) throw error;
+        return json(res, 200, { ok: true, message: "通報しました" });
+      }
+      case "report-resolve": {
+        if (!admin) throw fail("管理者権限が必要です", 403);
+        const reportId = requireId(payload.reportId, "通報IDが不正です");
+        const { error } = await db.from("reports").update({ status: "resolved" }).eq("id", reportId);
+        if (error) throw error;
+        return json(res, 200, { ok: true });
+      }
+      case "report": {
+        const message = String(payload.message || "").trim();
+        if (!message || message.length > 5000) throw fail("報告内容を入力してください", 400);
+        // [管理サイト連携] 報告は gather_reports に保存
+        const { error } = await db.from("gather_reports").insert({ user_id: user.id, username: user.username, content: message });
+        if (error) throw error;
+        return json(res, 200, { ok: true, message: "報告を送信しました" });
+      }
+
+      // ---------------- DM ----------------
       case "dm-list": {
         let q = db.from("messages").select("id,sender_id,receiver_id,content,created_at");
-        q = payload.withUserId
-          ? q.or(`and(sender_id.eq.${user.id},receiver_id.eq.${payload.withUserId}),and(sender_id.eq.${payload.withUserId},receiver_id.eq.${user.id})`).order("created_at", { ascending: true })
-          : q.or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`).order("created_at", { ascending: false });
+        if (payload.withUserId) {
+          const other = requireId(payload.withUserId, "相手のIDが不正です");
+          q = q.or(`and(sender_id.eq.${user.id},receiver_id.eq.${other}),and(sender_id.eq.${other},receiver_id.eq.${user.id})`).order("created_at", { ascending: true });
+        } else {
+          q = q.or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`).order("created_at", { ascending: false });
+        }
         const { data, error } = await q.limit(1000);
         if (error) throw error;
         return json(res, 200, { ok: true, messages: data || [] });
       }
       case "dm-send": {
-        const recipientId = String(payload.recipientId || "");
+        const recipientId = requireId(payload.recipientId, "宛先が不正です");
         const content = String(payload.content || "").trim();
-        if (!recipientId || !content || content.length > 10000) throw Object.assign(new Error("DMの内容を確認してください"), { status: 400 });
+        if (!content || content.length > 10000) throw fail("DMの内容を確認してください", 400);
+        if (recipientId === String(user.id)) throw fail("自分にはDMを送れません", 400);
+        const { data: recipient, error: recipientError } = await db.from("users").select("id").eq("id", recipientId).maybeSingle();
+        if (recipientError) throw recipientError;
+        if (!recipient) throw fail("送信先が見つかりません", 404);
         const { data, error } = await db.from("messages").insert({ sender_id: user.id, receiver_id: recipientId, content }).select("id,sender_id,receiver_id,content,created_at").single();
         if (error) throw error;
-        return json(res, 200, { ok: true, message: data });
+        // 同じ相手への通知は15分に1回まで
+        let notified = false;
+        try {
+          const since = new Date(Date.now() - 15 * 60000).toISOString();
+          const { data: recent } = await db.from("notifications").select("id").eq("user_id", recipientId).eq("actor_id", user.id).eq("type", "message").gte("created_at", since).limit(1);
+          if (!recent?.length) {
+            await addNotifications(db, [{ user_id: recipientId, actor_id: user.id, type: "message", message_id: data.id }]);
+            notified = true;
+          }
+        } catch (e) {
+          console.warn("dm notify failed:", e?.message || e);
+        }
+        return json(res, 200, { ok: true, message: data, notified });
       }
+
+      // ---------------- アカウント ----------------
       case "user-update": {
         const patch = {};
         for (const key of ownUserFields) if (Object.prototype.hasOwnProperty.call(payload, key)) patch[key] = payload[key];
@@ -438,18 +741,21 @@ module.exports = async (req, res) => {
         }
         if (Object.prototype.hasOwnProperty.call(payload, "newUsername")) {
           const name = String(payload.newUsername || "").trim();
-          if (name.length < 2 || name.length > 100) throw Object.assign(new Error("ユーザー名は2〜100文字にしてください"), { status: 400 });
+          if (name.length < 2 || name.length > 100) throw fail("ユーザー名は2〜100文字にしてください", 400);
           patch.username = name;
         }
         if (Object.prototype.hasOwnProperty.call(payload, "newPassword")) {
           const password = String(payload.newPassword || "");
-          if (password.length < 8) throw Object.assign(new Error("パスワードは8文字以上にしてください"), { status: 400 });
+          if (password.length < 8) throw fail("パスワードは8文字以上にしてください", 400);
           patch.password_hash = sha256(password);
         }
-        if (!Object.keys(patch).length) throw Object.assign(new Error("変更内容がありません"), { status: 400 });
+        if (!Object.keys(patch).length) throw fail("変更内容がありません", 400);
         const { data, error } = await db.from("users").update(patch).eq("id", user.id)
           .select("id,username,icon_url,cover_url,profile,role,verified,settings,program_urls,program_views,program_likes,profile_music,points,stamp_list,login_streak,last_login_date").single();
-        if (error) throw error;
+        if (error) {
+          if (error.code === "23505") throw fail("そのユーザー名は既に使用されています", 409);
+          throw error;
+        }
         return json(res, 200, { ok: true, user: data, message: "アカウント情報を更新しました" });
       }
       case "user-settings": {
@@ -459,94 +765,65 @@ module.exports = async (req, res) => {
           if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
           const value = input[key];
           if (["home_chat_enabled", "manual_chat_join", "chat_sound_enabled", "post_notification_sound_enabled"].includes(key)) {
-            if (typeof value !== "boolean") throw Object.assign(new Error(`設定値が不正です: ${key}`), { status: 400 });
+            if (typeof value !== "boolean") throw fail(`設定値が不正です: ${key}`, 400);
             settings[key] = value;
           } else if (key === "notification_volume") {
             const volume = Number(value);
-            if (!Number.isFinite(volume) || volume < 0 || volume > 1) throw Object.assign(new Error("通知音量は0〜1で指定してください"), { status: 400 });
+            if (!Number.isFinite(volume) || volume < 0 || volume > 1) throw fail("通知音量は0〜1で指定してください", 400);
             settings[key] = volume;
           } else if (key === "home_chat_width") {
             const width = Number(value);
-            if (!Number.isFinite(width) || width < 240 || width > 760) throw Object.assign(new Error("チャット幅は240〜760pxで指定してください"), { status: 400 });
+            if (!Number.isFinite(width) || width < 240 || width > 760) throw fail("チャット幅は240〜760pxで指定してください", 400);
             settings[key] = Math.round(width);
           } else if (key === "default_chat_room") {
             const room = String(value || "room").trim();
-            if (!room || room.length > 100) throw Object.assign(new Error("チャットルーム名が不正です"), { status: 400 });
+            if (!room || room.length > 100) throw fail("チャットルーム名が不正です", 400);
             settings[key] = room;
           } else if (key === "chat_theme") {
             const theme = String(value || "blue");
-            if (!["blue", "green", "red", "dark"].includes(theme)) throw Object.assign(new Error("チャットテーマが不正です"), { status: 400 });
+            if (!["blue", "green", "red", "dark"].includes(theme)) throw fail("チャットテーマが不正です", 400);
             settings[key] = theme;
           }
         }
-        if (!Object.keys(settings).length) throw Object.assign(new Error("保存する設定がありません"), { status: 400 });
+        if (!Object.keys(settings).length) throw fail("保存する設定がありません", 400);
         const { data, error } = await db.from("users").update({ settings: { ...(user.settings || {}), ...settings } }).eq("id", user.id).select("settings").single();
         if (error) throw error;
         return json(res, 200, { ok: true, settings: data.settings });
-      }
-      case "post-delete": {
-        const { data: post, error: readError } = await db.from("posts").select("id,user_id").eq("id", payload.postId).maybeSingle();
-        if (readError) throw readError;
-        if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
-        if (post.user_id !== user.id && !admin) throw Object.assign(new Error("削除権限がありません"), { status: 403 });
-        const { error } = await db.from("posts").delete().eq("id", post.id);
-        if (error) throw error;
-        return json(res, 200, { ok: true });
-      }
-      case "post-view": {
-        const { data: post, error } = await db.from("posts").select("id,user_id,views").eq("id", payload.postId).maybeSingle();
-        if (error) throw error;
-        if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
-        if (post.user_id === user.id) return json(res, 200, { ok: true, views: Number(post.views || 0) });
-        const views = Number(post.views || 0) + 1;
-        const { error: updateError } = await db.from("posts").update({ views }).eq("id", post.id);
-        if (updateError) throw updateError;
-        return json(res, 200, { ok: true, views });
-      }
-      case "post-pin": {
-        const { data: post, error } = await db.from("posts").select("id,user_id").eq("id", payload.postId).maybeSingle();
-        if (error) throw error;
-        if (!post) throw Object.assign(new Error("投稿が見つかりません"), { status: 404 });
-        if (post.user_id !== user.id && !admin) throw Object.assign(new Error("権限がありません"), { status: 403 });
-        if (payload.pinned) {
-          const { error: clearError } = await db.from("posts").update({ is_pinned: false }).eq("user_id", post.user_id).eq("is_pinned", true);
-          if (clearError) throw clearError;
-        }
-        const { error: updateError } = await db.from("posts").update({ is_pinned: !!payload.pinned }).eq("id", post.id);
-        if (updateError) throw updateError;
-        return json(res, 200, { ok: true, pinned: !!payload.pinned });
       }
       case "account-delete": {
         const { error } = await db.from("users").delete().eq("id", user.id);
         if (error) throw error;
         return json(res, 200, { ok: true });
       }
+
+      // ---------------- ポイント・スタンプ ----------------
       case "stamp-purchase": {
-        const amount = Number(payload.amount);
         const stampUrl = String(payload.stampUrl || "");
-        if (!Number.isInteger(amount) || amount < 1 || amount > 100000 || Number(user.points || 0) < amount || !stampUrl) {
-          throw Object.assign(new Error("スタンプ購入内容が不正です"), { status: 400 });
-        }
+        if (!stampUrl || stampUrl.length > 2000) throw fail("スタンプ購入内容が不正です", 400);
         const stamps = Array.isArray(user.stamp_list) ? user.stamp_list : [];
-        const { error } = await db.from("users").update({
-          points: Number(user.points || 0) - amount, stamp_list: [...stamps, stampUrl]
-        }).eq("id", user.id);
-        if (error) throw error;
-        return json(res, 200, { ok: true, points: Number(user.points || 0) - amount, stamp_list: [...stamps, stampUrl] });
+        if (stamps.includes(stampUrl)) throw fail("このスタンプは購入済みです", 409);
+        // 価格はクライアントの値を信用せず、スタンプ一覧から取得する
+        const price = await getStickerPrice(stampUrl);
+        if (price == null) throw fail("存在しないスタンプです", 404);
+        if (!Number.isInteger(price) || price < 1) throw fail("このスタンプは購入不要です", 400);
+        if (Number(user.points || 0) < price) throw fail("ポイントが足りません", 400);
+        const newStamps = [...stamps, stampUrl];
+        await updatePointsCas(db, user.id, user.points, { points: Number(user.points || 0) - price, stamp_list: newStamps });
+        return json(res, 200, { ok: true, points: Number(user.points || 0) - price, stamp_list: newStamps });
       }
       case "transfer-points": {
-        const targetUserId = String(payload.targetUserId || "");
+        const targetUserId = requireId(payload.targetUserId, "送信先が不正です");
         const amount = Number(payload.amount);
-        if (!targetUserId || targetUserId === user.id || !Number.isInteger(amount) || amount < 1 || amount > 1000 || Number(user.points || 0) < amount) {
-          throw Object.assign(new Error("ポイント送信内容が不正です"), { status: 400 });
+        if (targetUserId === String(user.id) || !Number.isInteger(amount) || amount < 1 || amount > 1000 || Number(user.points || 0) < amount) {
+          throw fail("ポイント送信内容が不正です", 400);
         }
         const { data: target, error: targetError } = await db.from("users").select("id,points").eq("id", targetUserId).maybeSingle();
         if (targetError) throw targetError;
-        if (!target) throw Object.assign(new Error("送信先が見つかりません"), { status: 404 });
-        const { error: debitError } = await db.from("users").update({ points: Number(user.points || 0) - amount }).eq("id", user.id);
-        if (debitError) throw debitError;
-        const { error: creditError } = await db.from("users").update({ points: Number(target.points || 0) + amount }).eq("id", target.id);
-        if (creditError) {
+        if (!target) throw fail("送信先が見つかりません", 404);
+        await updatePointsCas(db, user.id, user.points, { points: Number(user.points || 0) - amount });
+        try {
+          await updatePointsCas(db, target.id, target.points, { points: Number(target.points || 0) + amount });
+        } catch (creditError) {
           await db.from("users").update({ points: Number(user.points || 0) }).eq("id", user.id);
           throw creditError;
         }
@@ -554,7 +831,7 @@ module.exports = async (req, res) => {
       }
       case "chat-points": {
         const amount = Number(payload.amount);
-        if (!Number.isInteger(amount) || Math.abs(amount) > 5000) throw Object.assign(new Error("ポイント数が不正です"), { status: 400 });
+        if (!Number.isInteger(amount) || Math.abs(amount) > 5000) throw fail("ポイント数が不正です", 400);
         const points = Math.max(0, Number(user.points || 0) + amount);
         const { error } = await db.from("users").update({ points }).eq("id", user.id);
         if (error) throw error;
@@ -583,32 +860,79 @@ module.exports = async (req, res) => {
         const streak = awarded ? Number(user.consecutive_post_weeks || 0) + 1 : Number(user.consecutive_post_weeks || 0);
         const bonus = awarded ? 30 * streak : 0;
         const points = Number(user.points || 0) + bonus;
-        const { error } = await db.from("users").update({ points, consecutive_post_weeks: streak, last_post_week: week }).eq("id", user.id);
-        if (error) throw error;
-        return json(res, 200, { ok: true, awarded, points, streak, week });
+        if (awarded) {
+          const { error } = await db.from("users").update({ points, consecutive_post_weeks: streak, last_post_week: week }).eq("id", user.id);
+          if (error) throw error;
+          if (streak > 0) {
+            await addNotifications(db, [{
+              user_id: user.id, actor_id: user.id, type: "post_streak",
+              message: `連続投稿${streak}日間達成！${bonus}ポイント獲得`
+            }], { allowSelf: true });
+          }
+        }
+        return json(res, 200, { ok: true, awarded, points, streak, week, bonus });
       }
       case "image-register": {
         const imageUrl = String(payload.imageUrl || "");
-        if (!imageUrl || imageUrl.length > 5000) throw Object.assign(new Error("画像URLが不正です"), { status: 400 });
-        const { error } = await db.from("chat_image_assets").insert({ user_id: user.id, image_url: imageUrl, delete_url: payload.deleteUrl || null });
+        if (!imageUrl || imageUrl.length > 5000) throw fail("画像URLが不正です", 400);
+        const { error } = await db.from("chat_image_assets").insert({ user_id: user.id, image_url: imageUrl, delete_url: payload.deleteUrl ? String(payload.deleteUrl).slice(0, 5000) : null });
         if (error) throw error;
         return json(res, 200, { ok: true });
       }
-      case "report": {
+
+      // ---------------- チャット ----------------
+      // room_chat_history.user_id は既存データに合わせて "id-<uuid>" 形式で保存する
+      case "chat-history-add": {
         const message = String(payload.message || "").trim();
-        if (!message || message.length > 5000) throw Object.assign(new Error("報告内容を入力してください"), { status: 400 });
-        // [管理サイト連携] 報告は gather_reports に保存
-        const { error } = await db.from("gather_reports").insert({ user_id: user.id, username: user.username, content: message });
+        if (!message) throw fail("メッセージが空です", 400);
+        if (message.length > 2000) throw fail("メッセージが長すぎます", 400);
+        const msgId = payload.msgId == null || payload.msgId === "" ? null : requireId(payload.msgId, "メッセージIDが不正です");
+        let replyTo = null;
+        if (payload.replyTo && typeof payload.replyTo === "object") {
+          replyTo = {
+            msgId: payload.replyTo.msgId ? String(payload.replyTo.msgId).slice(0, 64) : null,
+            name: String(payload.replyTo.name || "").slice(0, 100),
+            snippet: String(payload.replyTo.snippet || "").slice(0, 200)
+          };
+        }
+        const { error } = await db.from("room_chat_history").insert({
+          username: user.username, user_id: "id-" + user.id, message, msg_id: msgId, reply_to: replyTo
+        });
         if (error) throw error;
-        return json(res, 200, { ok: true, message: "報告を送信しました" });
+        return json(res, 200, { ok: true });
       }
+      case "chat-history-delete": {
+        const msgId = requireId(payload.msgId, "メッセージIDが不正です");
+        let q = db.from("room_chat_history").delete().eq("msg_id", msgId);
+        if (!admin) q = q.in("user_id", ["id-" + user.id, String(user.id)]);
+        const { error } = await q;
+        if (error) throw error;
+        return json(res, 200, { ok: true });
+      }
+      case "developer-message-read": {
+        const ids = (Array.isArray(payload.ids) ? payload.ids : []).slice(0, 100).map(v => String(v)).filter(v => /^[A-Za-z0-9_-]{1,64}$/.test(v));
+        if (!ids.length) return json(res, 200, { ok: true });
+        const { error } = await db.from("developer_messages").update({ read: true }).in("id", ids).eq("user_id", user.id);
+        if (error) throw error;
+        return json(res, 200, { ok: true });
+      }
+      case "developer-inbox-send": {
+        const message = String(payload.message || "").trim();
+        if (!message || message.length > 2000) throw fail("内容を入力してください(2000文字まで)", 400);
+        const { error } = await db.from("developer_inbox").insert({ user_id: user.id, username: user.username, message });
+        if (error) throw error;
+        return json(res, 200, { ok: true });
+      }
+
+      // ---------------- 管理 ----------------
       case "ban": {
-        if (!admin) throw Object.assign(new Error("BAN権限がありません"), { status: 403 });
-        const targetId = String(payload.targetUserId || "");
+        if (!admin) throw fail("BAN権限がありません", 403);
+        const targetId = requireId(payload.targetUserId, "対象ユーザーが不正です");
         const minutes = Math.max(1, Math.min(525600, Number(payload.banMinutes) || 5));
-        const { data: target, error: targetError } = await db.from("users").select("id,ban_count,points").eq("id", targetId).maybeSingle();
+        const { data: target, error: targetError } = await db.from("users").select("id,role,ban_count,points").eq("id", targetId).maybeSingle();
         if (targetError) throw targetError;
-        if (!target) throw Object.assign(new Error("対象ユーザーが見つかりません"), { status: 404 });
+        if (!target) throw fail("対象ユーザーが見つかりません", 404);
+        if (target.role === "developer" && user.role !== "developer") throw fail("developerをBANできるのはdeveloperのみです", 403);
         const banUntil = new Date(Date.now() + minutes * 60000).toISOString();
         const { error } = await db.from("users").update({
           ban_count: Number(target.ban_count || 0) + 1,
@@ -619,35 +943,61 @@ module.exports = async (req, res) => {
         return json(res, 200, { ok: true, banUntil });
       }
       case "admin-user-update": {
-        if (!admin) throw Object.assign(new Error("管理者権限が必要です"), { status: 403 });
-        const targetId = String(payload.targetUserId || "");
+        if (!admin) throw fail("管理者権限が必要です", 403);
+        const targetId = requireId(payload.targetUserId, "対象ユーザーが不正です");
+        const { data: target, error: targetError } = await db.from("users").select("id,role").eq("id", targetId).maybeSingle();
+        if (targetError) throw targetError;
+        if (!target) throw fail("対象ユーザーが見つかりません", 404);
+        if (target.role === "developer" && user.role !== "developer") throw fail("developerを変更できるのはdeveloperのみです", 403);
+        if (payload.deleteAccount === true) {
+          const { error } = await db.from("users").delete().eq("id", targetId);
+          if (error) throw error;
+          return json(res, 200, { ok: true, message: "ユーザーを削除しました" });
+        }
         const patch = {};
         if (Object.prototype.hasOwnProperty.call(payload, "role")) {
           const role = String(payload.role);
-          if (!["user", "admin", "developer"].includes(role)) throw Object.assign(new Error("ロールが不正です"), { status: 400 });
-          if (role === "developer" && user.role !== "developer") throw Object.assign(new Error("developer権限の付与はdeveloperのみ可能です"), { status: 403 });
+          if (!["user", "admin", "developer"].includes(role)) throw fail("ロールが不正です", 400);
+          if (role === "developer" && user.role !== "developer") throw fail("developer権限の付与はdeveloperのみ可能です", 403);
           patch.role = role;
         }
         if (Object.prototype.hasOwnProperty.call(payload, "verified")) {
-          if (typeof payload.verified !== "boolean") throw Object.assign(new Error("認証状態が不正です"), { status: 400 });
+          if (typeof payload.verified !== "boolean") throw fail("認証状態が不正です", 400);
           patch.verified = payload.verified;
         }
-        for (const key of ["ban_until", "ban_count", "points"]) if (Object.prototype.hasOwnProperty.call(payload, key)) patch[key] = payload[key];
+        // クライアントの banUntil / 管理サイトの ban_until どちらも受け付ける
+        const banKey = Object.prototype.hasOwnProperty.call(payload, "banUntil") ? "banUntil" : (Object.prototype.hasOwnProperty.call(payload, "ban_until") ? "ban_until" : null);
+        if (banKey) {
+          const v = payload[banKey];
+          if (v === null) patch.ban_until = null;
+          else {
+            const d = new Date(v);
+            if (Number.isNaN(d.getTime())) throw fail("BAN期限が不正です", 400);
+            patch.ban_until = d.toISOString();
+          }
+        }
+        for (const key of ["ban_count", "points"]) {
+          if (Object.prototype.hasOwnProperty.call(payload, key)) {
+            const n = Number(payload[key]);
+            if (!Number.isFinite(n)) throw fail(`${key} が不正です`, 400);
+            patch[key] = Math.trunc(n);
+          }
+        }
         if (Object.prototype.hasOwnProperty.call(payload, "newPassword")) {
           const password = String(payload.newPassword || "");
-          if (password.length < 8) throw Object.assign(new Error("パスワードは8文字以上にしてください"), { status: 400 });
+          if (password.length < 8) throw fail("パスワードは8文字以上にしてください", 400);
           patch.password_hash = sha256(password);
         }
-        if (!targetId || !Object.keys(patch).length) throw Object.assign(new Error("変更内容を確認してください"), { status: 400 });
+        if (!Object.keys(patch).length) throw fail("変更内容を確認してください", 400);
         const { error } = await db.from("users").update(patch).eq("id", targetId);
         if (error) throw error;
         return json(res, 200, { ok: true });
       }
       case "ip-ban": {
-        if (!admin) throw Object.assign(new Error("管理者権限が必要です"), { status: 403 });
+        if (!admin) throw fail("管理者権限が必要です", 403);
         const rawIp = String(payload.ipAddress || "").trim();
         if (!rawIp || rawIp.length > 100 || !/^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(rawIp)) {
-          throw Object.assign(new Error("IPアドレスの形式が不正です"), { status: 400 });
+          throw fail("IPアドレスの形式が不正です", 400);
         }
         const minutes = Math.max(1, Math.min(525600, Number(payload.minutes) || 60));
         const { error } = await db.from("banned_ip_addresses").upsert({
@@ -658,10 +1008,10 @@ module.exports = async (req, res) => {
         return json(res, 200, { ok: true, expiresAt: new Date(Date.now() + minutes * 60000).toISOString() });
       }
       case "ip-unban": {
-        if (!admin) throw Object.assign(new Error("管理者権限が必要です"), { status: 403 });
+        if (!admin) throw fail("管理者権限が必要です", 403);
         const rawIp = String(payload.ipAddress || "").trim();
         if (!rawIp || rawIp.length > 100 || !/^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(rawIp)) {
-          throw Object.assign(new Error("IPアドレスの形式が不正です"), { status: 400 });
+          throw fail("IPアドレスの形式が不正です", 400);
         }
         const { error } = await db.from("banned_ip_addresses").delete().eq("ip_hash", hashIp(rawIp));
         if (error) throw error;
