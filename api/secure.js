@@ -408,12 +408,13 @@ async function addNotifications(
       rows = kept;
       if (!rows.length) return;
     }
-    for (const part of chunk(rows, 500)) {
-      const { error } = await db.from("notifications").insert(part);
-      if (error) console.warn("notification insert failed:", error.message);
-    }
-    for (const uid of [...new Set(rows.map((r) => r.user_id))].slice(0, 20))
-      await trimNotifications(db, uid);
+    const insertResults = await Promise.all(
+      chunk(rows, 500).map((part) => db.from("notifications").insert(part))
+    );
+    for (const result of insertResults) {
+      if (result.error)
+        console.warn("notification insert failed:", result.error.message);
+    } /* 通知の古いデータ整理は投稿API内で行わない。フォロワー数に比例して数十回のDB通信が発生し、Vercelの10秒制限に達するため。整理は通知を読む操作など別の機会に行う。 */
   } catch (e) {
     console.warn("addNotifications failed:", e?.message || e);
   }
@@ -849,13 +850,13 @@ module.exports = async (req, res) => {
     const { user } = await authenticateSession(db, req);
     const admin = ["admin", "developer"].includes(user.role);
     const payload = body.payload || {};
-    await axiomLog("access", ip, {
+    void axiomLog("access", ip, {
       ip_hash: ipHash,
       action,
       page: String(body.page || req.headers.referer || "").slice(0, 300),
       user_id: String(user.id),
       username: String(user.username || ""),
-    });
+    }).catch(() => {});
     switch (action) {
       case "limited-post-list": {
         if (!user.verified && !admin)
@@ -938,59 +939,66 @@ module.exports = async (req, res) => {
           poll,
           views: 0,
         };
+        // 投稿の保存を最優先にし、投稿行が作成された後の処理で投稿結果を失敗扱いにしない。
         const { data, error } = await db
           .from("posts")
           .insert(row)
           .select("*")
           .single();
         if (error) throw error;
-        try {
-          const { data: follows } = await db
-            .from("follows")
-            .select("follower_id")
-            .eq("following_id", user.id);
-          let followerIds = [
-            ...new Set(
-              (follows || [])
-                .map((f) => f.follower_id)
-                .filter((id) => id && String(id) !== String(user.id))
-            ),
-          ];
-          if (isLimited && followerIds.length) {
-            const ok = [];
-            for (const part of chunk(followerIds, 200)) {
-              const { data: vs } = await db
-                .from("users")
-                .select("id")
-                .in("id", part)
-                .eq("verified", true);
-              ok.push(...(vs || []).map((v) => v.id));
+        // フォロワー通知と週次ボーナスを並行実行し、順番待ちを減らす。
+        const notificationTask = (async () => {
+          try {
+            const { data: follows, error: followError } = await db
+              .from("follows")
+              .select("follower_id")
+              .eq("following_id", user.id);
+            if (followError) throw followError;
+            let followerIds = [
+              ...new Set(
+                (follows || [])
+                  .map((f) => f.follower_id)
+                  .filter((id) => id && String(id) !== String(user.id))
+              ),
+            ];
+            if (isLimited && followerIds.length) {
+              const verifiedChunks = await Promise.all(
+                chunk(followerIds, 200).map((part) =>
+                  db
+                    .from("users")
+                    .select("id")
+                    .in("id", part)
+                    .eq("verified", true)
+                )
+              );
+              followerIds = verifiedChunks.flatMap((result) => {
+                if (result.error) throw result.error;
+                return (result.data || []).map((v) => v.id);
+              });
             }
-            followerIds = ok;
+            await addNotifications(
+              db,
+              followerIds.map((uid) => ({
+                user_id: uid,
+                actor_id: user.id,
+                type: "post",
+                post_id: data.id,
+              }))
+            );
+          } catch (e) {
+            console.warn("post notify failed:", e?.message || e);
           }
-          await addNotifications(
-            db,
-            followerIds.map((uid) => ({
-              user_id: uid,
-              actor_id: user.id,
-              type: "post",
-              post_id: data.id,
-            }))
-          );
-        } catch (e) {
-          console.warn("post notify failed:", e?.message || e);
-        }
-        await countHashtags(db, content);
+        })();
         let postBonus = { awarded: false, bonus: 0, reason: "not_processed" };
-        try {
-          postBonus = await awardWeeklyPostBonus(db, user.id);
-        } catch (bonusError) {
-          console.warn(
-            "weekly post bonus failed:",
-            bonusError?.message || bonusError
-          );
-          postBonus = { awarded: false, bonus: 0, reason: "error" };
-        }
+        const bonusTask = (async () => {
+          try {
+            postBonus = await awardWeeklyPostBonus(db, user.id);
+          } catch (e) {
+            console.warn("weekly post bonus failed:", e?.message || e);
+            postBonus = { awarded: false, bonus: 0, reason: "error" };
+          }
+        })();
+        await Promise.all([notificationTask, bonusTask]);
         return json(res, 200, {
           ok: true,
           post: data,
