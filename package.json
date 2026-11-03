@@ -1,5 +1,15 @@
 {
   "name": "chanpro-gather-api",
+  "version": "1.0.0",
   "private": true,
-  "dependencies": { "@supabase/supabase-js": "^2.45.0" }
+  "description": "YouTube-API",
+  "main": "YouTube-api.js",
+  "scripts": {
+    "start": "node YouTube-api.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "@vreden/youtube_scraper": "^1.1.2",
+    "express": "^4.19.2"
+  }
 }
