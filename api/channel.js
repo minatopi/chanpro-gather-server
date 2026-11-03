@@ -21,8 +21,11 @@ function sendJson(res, status, data) {
   return res.status(status).json(data);
 }
 
+
 function getChannelKey(channelUrl) {
   const parsed = new URL(channelUrl);
+
+  const host = parsed.hostname.toLowerCase();
 
   const allowedHosts = [
     "youtube.com",
@@ -32,14 +35,27 @@ function getChannelKey(channelUrl) {
     "www.youtu.be"
   ];
 
-  if (!allowedHosts.includes(parsed.hostname.toLowerCase())) {
+  if (!allowedHosts.includes(host)) {
     throw new Error("YouTubeのURLを指定してください。");
   }
 
   const parts = parsed.pathname.split("/").filter(Boolean);
 
-  return parts[parts.length - 1] || parsed.hostname;
+  if (host.includes("youtu.be")) {
+    return parts[0] || host;
+  }
+
+  if (parts[0] === "channel" || parts[0] === "c" || parts[0] === "user") {
+    return parts[1] || parts[0];
+  }
+
+  if (parts[0] && parts[0].startsWith("@")) {
+    return parts[0];
+  }
+
+  return parts[0] || host;
 }
+
 
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
