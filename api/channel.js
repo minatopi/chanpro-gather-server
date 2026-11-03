@@ -2,41 +2,36 @@
 const { createClient } = require("@supabase/supabase-js");
 const { channel } = require("@vreden/youtube_scraper");
 
-// ========================================
-// Environment
-// ========================================
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const supabase =
   SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(
-        SUPABASE_URL,
-        SUPABASE_SERVICE_ROLE_KEY,
-        {
-          auth: {
-            persistSession: false,
-            autoRefreshToken: false
-          }
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false
         }
-      )
+      })
     : null;
 
 const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 15000;
 
-// ========================================
-// Response
-// ========================================
+const ALLOWED_HOSTS = [
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "youtu.be",
+  "www.youtu.be"
+];
 
 function sendJson(res, status, data) {
   return res.status(status).json(data);
 }
 
 // ========================================
-// URL validation
+// チャンネルURL検証
 // ========================================
 
 function getChannelKey(channelUrl) {
@@ -44,19 +39,13 @@ function getChannelKey(channelUrl) {
 
   const host = parsed.hostname.toLowerCase();
 
-  const allowedHosts = [
-    "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
-    "youtu.be",
-    "www.youtu.be"
-  ];
-
   if (
-    !allowedHosts.includes(host) ||
-    !["https:", "http:"].includes(parsed.protocol)
+    parsed.protocol !== "https:" ||
+    !ALLOWED_HOSTS.includes(host) ||
+    parsed.username ||
+    parsed.password
   ) {
-    throw new Error("YouTubeのURLを指定してください。");
+    throw new Error("有効なYouTubeのHTTPS URLを指定してください。");
   }
 
   const parts = parsed.pathname.split("/").filter(Boolean);
@@ -66,14 +55,12 @@ function getChannelKey(channelUrl) {
   }
 
   if (
-    parts[0] === "channel" ||
-    parts[0] === "c" ||
-    parts[0] === "user"
+    ["channel", "c", "user"].includes(parts[0])
   ) {
     return parts[1] || parts[0];
   }
 
-  if (parts[0]?.startsWith("@")) {
+  if (parts[0] && parts[0].startsWith("@")) {
     return parts[0];
   }
 
@@ -81,230 +68,205 @@ function getChannelKey(channelUrl) {
 }
 
 // ========================================
-// Image URL normalization
+// 登録者数を数値に変換
 // ========================================
 
-function normalizeImageUrl(value) {
-  if (typeof value !== "string" || !value) {
+function parseSubscriberCount(value) {
+  if (value === null || value === undefined) {
     return null;
   }
 
-  let url = value
-    .replace(/\\u0026/g, "&")
-    .replace(/\\\//g, "/")
-    .replace(/&amp;/g, "&")
-    .trim();
-
-  try {
-    const parsed = new URL(url);
-
-    if (
-      parsed.protocol !== "https:" &&
-      parsed.protocol !== "http:"
-    ) {
-      return null;
-    }
-
-    return parsed.href;
-  } catch {
-    return null;
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value >= 0
+      ? Math.round(value)
+      : null;
   }
-}
 
-// ========================================
-// Extract image from scraper
-// ========================================
+  if (typeof value === "object") {
+    value =
+      value.simpleText ||
+      value.text ||
+      value.label ||
+      value.accessibility?.accessibilityData?.label;
 
-function getAvatar(scraped) {
-  if (!scraped) return null;
+    if (!value) return null;
+  }
 
-  const candidates = [
-    scraped.avatar,
-    scraped.avatarUrl,
-    scraped.thumbnail,
-    scraped.profilePicture,
-    scraped.profilePictureUrl,
-    scraped.thumbnails?.high,
-    scraped.thumbnails?.medium,
-    scraped.thumbnails?.default
-  ];
+  const text = String(value)
+    .replace(/,/g, "")
+    .replace(/\s/g, "")
+    .replace(/&nbsp;/g, "");
 
-  for (const candidate of candidates) {
-    if (typeof candidate === "string") {
-      const url = normalizeImageUrl(candidate);
-      if (url) return url;
-    }
+  if (!text) return null;
 
-    if (candidate && typeof candidate === "object") {
-      const url = normalizeImageUrl(
-        candidate.url || candidate.src
-      );
+  // 数値のみ
+  if (/^\d+$/.test(text)) {
+    return Number(text);
+  }
 
-      if (url) return url;
+  // 日本語: 万・億
+  const japanese = text.match(
+    /([\d.]+)(億|万)/
+  );
 
-      if (Array.isArray(candidate)) {
-        for (const item of candidate) {
-          const itemUrl = normalizeImageUrl(item?.url);
-          if (itemUrl) return itemUrl;
-        }
-      }
-    }
+  if (japanese) {
+    const number = Number(japanese[1]);
+
+    const multiplier =
+      japanese[2] === "億"
+        ? 100000000
+        : 10000;
+
+    return Number.isFinite(number)
+      ? Math.round(number * multiplier)
+      : null;
+  }
+
+  // 英語: K / M / B
+  const english = text.match(
+    /([\d.]+)([KMB])/i
+  );
+
+  if (english) {
+    const number = Number(english[1]);
+
+    const multipliers = {
+      K: 1000,
+      M: 1000000,
+      B: 1000000000
+    };
+
+    return Number.isFinite(number)
+      ? Math.round(
+          number * multipliers[english[2].toUpperCase()]
+        )
+      : null;
+  }
+
+  // 数字と登録者数表記
+  const plain = text.match(/(\d+)/);
+
+  if (
+    plain &&
+    /subscriber|登録者|subscribers/i.test(text)
+  ) {
+    return Number(plain[1]);
   }
 
   return null;
 }
 
 // ========================================
-// Extract ytInitialData JSON
+// HTML内の登録者数を抽出
 // ========================================
 
-function extractInitialData(html) {
-  const markers = [
-    "var ytInitialData =",
-    "ytInitialData =",
-    '"ytInitialData":'
-  ];
+function extractSubscribersFromHTML(html) {
+  if (!html) return null;
 
-  for (const marker of markers) {
-    const markerIndex = html.indexOf(marker);
-
-    if (markerIndex === -1) continue;
-
-    const start = html.indexOf("{", markerIndex);
-
-    if (start === -1) continue;
-
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-
-    for (let i = start; i < html.length; i++) {
-      const char = html[i];
-
-      if (inString) {
-        if (escaped) {
-          escaped = false;
-        } else if (char === "\\") {
-          escaped = true;
-        } else if (char === '"') {
-          inString = false;
-        }
-
-        continue;
-      }
-
-      if (char === '"') {
-        inString = true;
-      } else if (char === "{") {
-        depth++;
-      } else if (char === "}") {
-        depth--;
-
-        if (depth === 0) {
-          try {
-            return JSON.parse(html.slice(start, i + 1));
-          } catch {
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-// ========================================
-// Search avatar in initial data
-// ========================================
-
-function findAvatarInData(data) {
   const candidates = [];
 
-  function walk(node, depth = 0) {
-    if (!node || typeof node !== "object" || depth > 40) {
-      return;
-    }
+  // 1. subscriberCountText
+  const patterns = [
+    /"subscriberCountText"\s*:\s*(\{[\s\S]{0,1500}?\})/g,
+    /"subscriberCountText"\s*:\s*"([^"]+)"/g
+  ];
 
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        walk(item, depth + 1);
-      }
-      return;
-    }
+  for (const pattern of patterns) {
+    let match;
 
-    for (const [key, value] of Object.entries(node)) {
-      if (
-        key === "avatar" ||
-        key === "avatarViewModel" ||
-        key === "profilePicture"
-      ) {
-        if (value && typeof value === "object") {
-          const thumbnails = value.thumbnails;
-
-          if (Array.isArray(thumbnails)) {
-            for (const item of thumbnails) {
-              const url = normalizeImageUrl(item?.url);
-              if (url) candidates.push(url);
-            }
-          }
-
-          const sources = value.image?.sources;
-
-          if (Array.isArray(sources)) {
-            for (const item of sources) {
-              const url = normalizeImageUrl(item?.url);
-              if (url) candidates.push(url);
-            }
-          }
-
-          const directUrl = normalizeImageUrl(value.url);
-
-          if (directUrl) {
-            candidates.push(directUrl);
-          }
-        }
-      }
-
-      walk(value, depth + 1);
+    while ((match = pattern.exec(html)) !== null) {
+      candidates.push(match[1]);
     }
   }
 
-  walk(data);
+  // 2. subscriberCountText周辺のsimpleText
+  const subscriberIndexes = [];
+  const keyPattern = /subscriberCountText/g;
 
-  // 大きい画像を優先
-  return candidates[candidates.length - 1] || null;
-}
+  let keyMatch;
 
-// ========================================
-// Extract og:image
-// ========================================
+  while ((keyMatch = keyPattern.exec(html)) !== null) {
+    subscriberIndexes.push(keyMatch.index);
+  }
 
-function decodeHtml(value) {
-  return value
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
-}
+  for (const index of subscriberIndexes) {
+    const section = html.slice(
+      index,
+      index + 1500
+    );
 
-function getOgImage(html) {
-  const tags = html.match(/<meta\b[^>]*>/gi) || [];
+    const simpleText = section.match(
+      /"simpleText"\s*:\s*"((?:\\.|[^"\\])*)"/
+    );
 
-  for (const tag of tags) {
-    const property =
-      tag.match(/\bproperty=["']([^"']+)["']/i)?.[1] ||
-      tag.match(/\bname=["']([^"']+)["']/i)?.[1];
+    if (simpleText) {
+      try {
+        candidates.push(
+          JSON.parse(`"${simpleText[1]}"`)
+        );
+      } catch {
+        candidates.push(simpleText[1]);
+      }
+    }
 
-    const content =
-      tag.match(/\bcontent=["']([^"']+)["']/i)?.[1];
+    const accessibility = section.match(
+      /"label"\s*:\s*"((?:\\.|[^"\\])*)"/
+    );
 
+    if (accessibility) {
+      try {
+        candidates.push(
+          JSON.parse(`"${accessibility[1]}"`)
+        );
+      } catch {
+        candidates.push(accessibility[1]);
+      }
+    }
+  }
+
+  // 3. 登録者数に関するHTMLの表示文字列
+  const textPatterns = [
+    /([\d,.]+\s*(?:億|万|[KMB])?)\s*人の登録者/g,
+    /([\d,.]+\s*(?:億|万|[KMB])?)\s*subscribers/gi,
+    /([\d,.]+\s*(?:億|万|[KMB])?)\s*登録者/g
+  ];
+
+  for (const pattern of textPatterns) {
+    let match;
+
+    while ((match = pattern.exec(html)) !== null) {
+      candidates.push(match[1]);
+    }
+  }
+
+  // 4. JSON形式の候補から数値を取得
+  for (const candidate of candidates) {
+    const count = parseSubscriberCount(candidate);
+
+    if (count !== null) {
+      return count;
+    }
+
+    // JSONオブジェクト文字列の場合
     if (
-      property?.toLowerCase() === "og:image" &&
-      content
+      typeof candidate === "string" &&
+      candidate.startsWith("{")
     ) {
-      return normalizeImageUrl(decodeHtml(content));
+      try {
+        const obj = JSON.parse(candidate);
+
+        const nestedCount = parseSubscriberCount(
+          obj.simpleText ||
+          obj.accessibility?.accessibilityData?.label ||
+          obj.runs?.[0]?.text
+        );
+
+        if (nestedCount !== null) {
+          return nestedCount;
+        }
+      } catch {
+        // 次の候補を試す
+      }
     }
   }
 
@@ -312,109 +274,95 @@ function getOgImage(html) {
 }
 
 // ========================================
-// Fetch avatar from YouTube page
+// YouTube HTMLを安全に取得
 // ========================================
 
-async function getAvatarFromPage(channelUrl) {
-  try {
-    const response = await fetch(channelUrl, {
+async function fetchYouTubeHTML(channelUrl) {
+  let currentUrl = new URL(channelUrl);
+
+  for (let i = 0; i < 5; i++) {
+    if (
+      currentUrl.protocol !== "https:" ||
+      !ALLOWED_HOSTS.includes(
+        currentUrl.hostname.toLowerCase()
+      )
+    ) {
+      throw new Error("YouTube以外へのリダイレクトを拒否しました。");
+    }
+
+    const response = await fetch(currentUrl.toString(), {
       method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(15000),
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+          "AppleWebKit/537.36 (KHTML, like Gecko) " +
+          "Chrome/131.0.0.0 Safari/537.36",
         "Accept":
           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
-      },
-      redirect: "follow",
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      }
     });
 
-    if (!response.ok) {
-      console.error(
-        "YouTube page response:",
-        response.status
-      );
-      return null;
-    }
-
-    const finalUrl = new URL(response.url);
-
     if (
-      ![
-        "youtube.com",
-        "www.youtube.com",
-        "m.youtube.com"
-      ].includes(finalUrl.hostname.toLowerCase())
+      [301, 302, 303, 307, 308].includes(response.status)
     ) {
-      return null;
+      const location = response.headers.get("location");
+
+      if (!location) {
+        throw new Error("YouTubeのリダイレクト先がありません。");
+      }
+
+      currentUrl = new URL(location, currentUrl);
+      continue;
     }
 
-    const html = await response.text();
-
-    // 1. ytInitialData
-    const initialData = extractInitialData(html);
-
-    const initialAvatar = findAvatarInData(initialData);
-
-    if (initialAvatar) {
-      console.log("Avatar found in ytInitialData");
-      return initialAvatar;
+    if (!response.ok) {
+      throw new Error(
+        `YouTube HTML取得失敗: ${response.status}`
+      );
     }
 
-    // 2. og:image
-    const ogImage = getOgImage(html);
-
-    if (ogImage) {
-      console.log("Avatar found in og:image");
-      return ogImage;
-    }
-
-    console.log("Avatar not found in YouTube HTML");
-
-    return null;
-
-  } catch (error) {
-    console.error(
-      "YouTube page avatar error:",
-      error.message
-    );
-
-    return null;
+    return await response.text();
   }
+
+  throw new Error("リダイレクト回数の上限を超えました。");
 }
 
 // ========================================
-// Cache validation
+// スクレイパーの登録者数を取得
 // ========================================
 
-function isCacheValid(data) {
-  if (!data?.updated_at || !data?.avatar_url) {
-    return false;
+function getScrapedSubscribers(scraped) {
+  if (!scraped) return null;
+
+  const candidates = [
+    scraped.subscribers,
+    scraped.subscriberCount,
+    scraped.subscriber_count,
+    scraped.subscribersCount,
+    scraped.subscriberCountText,
+    scraped.subscribersText,
+    scraped.followers
+  ];
+
+  for (const candidate of candidates) {
+    const count = parseSubscriberCount(candidate);
+
+    if (count !== null) {
+      return count;
+    }
   }
 
-  const updatedAt = new Date(data.updated_at).getTime();
-
-  if (!Number.isFinite(updatedAt)) {
-    return false;
-  }
-
-  const age = Date.now() - updatedAt;
-
-  return (
-    age >= 0 &&
-    age < CACHE_EXPIRATION_MS &&
-    Boolean(normalizeImageUrl(data.avatar_url))
-  );
+  return null;
 }
 
 // ========================================
-// Main API
+// メインAPI
 // ========================================
 
 module.exports = async function handler(req, res) {
-
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
 
   res.setHeader(
@@ -467,21 +415,19 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  let cachedData = null;
-
   try {
+    // ====================================
+    // 1. Supabaseキャッシュ取得
+    // ====================================
 
-    // 1. Supabase cache
     const {
-      data,
+      data: cachedData,
       error: dbError
     } = await supabase
       .from("youtube_channels")
       .select("*")
       .eq("id", channelKey)
       .maybeSingle();
-
-    cachedData = data;
 
     if (dbError) {
       console.error(
@@ -490,93 +436,165 @@ module.exports = async function handler(req, res) {
       );
     }
 
-    // 2. 有効なアイコン付きキャッシュ
-    if (isCacheValid(cachedData)) {
-      console.log("Using database cache:", channelKey);
+    // ====================================
+    // 2. キャッシュ判定
+    // ====================================
 
-      return sendJson(res, 200, {
-        status: "success",
-        source: "database_cache",
-        data: {
-          channelName: cachedData.channel_name,
-          subscribers: cachedData.subscribers,
-          avatarUrl: cachedData.avatar_url,
-          description: cachedData.description,
-          bannerUrl: cachedData.banner_url,
-          isVerified: cachedData.is_verified,
-          updatedAt: cachedData.updated_at
-        }
-      });
+    if (cachedData && cachedData.updated_at) {
+      const updatedAt = new Date(
+        cachedData.updated_at
+      ).getTime();
+
+      const cachedSubscribers = parseSubscriberCount(
+        cachedData.subscribers
+      );
+
+      if (
+        Number.isFinite(updatedAt) &&
+        Date.now() - updatedAt < CACHE_EXPIRATION_MS &&
+        cachedSubscribers !== null
+      ) {
+        return sendJson(res, 200, {
+          status: "success",
+          source: "database_cache",
+          data: {
+            channelName: cachedData.channel_name,
+            subscribers: cachedSubscribers,
+            avatarUrl: cachedData.avatar_url,
+            description: cachedData.description,
+            bannerUrl: cachedData.banner_url,
+            isVerified: cachedData.is_verified,
+            updatedAt: cachedData.updated_at
+          }
+        });
+      }
+
+      console.log(
+        "Cache expired or subscriber count missing. Refetching:",
+        channelKey
+      );
     }
 
-    // 3. YouTube scraper
-    console.log("Fetching YouTube channel:", channelKey);
+    // ====================================
+    // 3. YouTubeスクレイパー
+    // ====================================
 
-    const scraped = await channel(channelUrl);
+    console.log(
+      "Fetching YouTube channel:",
+      channelKey
+    );
 
-    if (!scraped || !scraped.title) {
+    let scraped = null;
+
+    try {
+      scraped = await channel(channelUrl);
+    } catch (error) {
+      console.error(
+        "youtube_scraper error:",
+        error.message
+      );
+    }
+
+    // ====================================
+    // 4. 登録者数を複数の方法で取得
+    // ====================================
+
+    let subscribers = getScrapedSubscribers(scraped);
+
+    let html = null;
+
+    // スクレイパーから取れない場合はHTMLを取得
+    if (subscribers === null) {
+      try {
+        console.log(
+          "Subscriber count missing. Fetching YouTube HTML:",
+          channelKey
+        );
+
+        html = await fetchYouTubeHTML(channelUrl);
+
+        subscribers = extractSubscribersFromHTML(html);
+
+      } catch (error) {
+        console.error(
+          "HTML subscriber scraping error:",
+          error.message
+        );
+      }
+    }
+
+    // ====================================
+    // 5. チャンネル情報の確認
+    // ====================================
+
+    if (!scraped && !html) {
       throw new Error(
         "YouTubeチャンネル情報を取得できませんでした。"
       );
     }
 
-    // 4. Avatar extraction
-    let avatarUrl = getAvatar(scraped);
-
-    // 5. YouTube HTML fallback
-    if (!avatarUrl) {
-      console.log("Trying YouTube HTML avatar extraction");
-
-      avatarUrl = await getAvatarFromPage(channelUrl);
-    }
-
-    // 6. Existing avatar fallback
-    if (!avatarUrl && cachedData?.avatar_url) {
-      avatarUrl = normalizeImageUrl(
-        cachedData.avatar_url
-      );
-
-      if (avatarUrl) {
-        console.log("Using previous avatar cache");
-      }
-    }
-
-    // 7. Profile data
+    // HTML取得だけ成功した場合も処理
     const profileData = {
       channelName:
-        scraped.title ||
+        scraped?.title ||
+        scraped?.name ||
         cachedData?.channel_name ||
         null,
 
-      subscribers:
-        scraped.subscribers ??
-        cachedData?.subscribers ??
+      subscribers,
+
+      avatarUrl:
+        scraped?.avatar ||
+        scraped?.thumbnail ||
+        cachedData?.avatar_url ||
         null,
 
-      avatarUrl,
-
       description:
-        scraped.description ??
-        cachedData?.description ??
+        scraped?.description ||
+        cachedData?.description ||
         "",
 
       bannerUrl:
-        scraped.banner ??
-        cachedData?.banner_url ??
+        scraped?.banner ||
+        cachedData?.banner_url ||
         null,
 
       isVerified:
-        scraped.verified !== undefined
+        scraped?.verified !== undefined
           ? Boolean(scraped.verified)
           : Boolean(cachedData?.is_verified)
     };
 
-    // 8. Supabase save
+    // HTMLからもチャンネル名を補完
+    if (!profileData.channelName && html) {
+      const titleMatch = html.match(
+        /"channelMetadataRenderer"[\s\S]{0,3000}?"title"\s*:\s*"((?:\\.|[^"\\])*)"/
+      );
+
+      if (titleMatch) {
+        try {
+          profileData.channelName = JSON.parse(
+            `"${titleMatch[1]}"`
+          );
+        } catch {
+          profileData.channelName = null;
+        }
+      }
+    }
+
+    if (!profileData.channelName) {
+      throw new Error(
+        "チャンネル名を取得できませんでした。"
+      );
+    }
+
+    // ====================================
+    // 6. Supabaseに保存
+    // ====================================
+
     const updatedAt = new Date().toISOString();
 
-    const {
-      error: upsertError
-    } = await supabase
+    const { error: upsertError } = await supabase
       .from("youtube_channels")
       .upsert(
         {
@@ -601,7 +619,10 @@ module.exports = async function handler(req, res) {
       );
     }
 
-    // 9. Response
+    // ====================================
+    // 7. APIレスポンス
+    // ====================================
+
     return sendJson(res, 200, {
       status: "success",
       source: "youtube_live",
@@ -612,25 +633,10 @@ module.exports = async function handler(req, res) {
     });
 
   } catch (error) {
-
-    console.error("YouTube API Error:", error);
-
-    // 10. Database fallback
-    if (cachedData?.channel_name) {
-      return sendJson(res, 200, {
-        status: "success",
-        source: "database_fallback",
-        data: {
-          channelName: cachedData.channel_name,
-          subscribers: cachedData.subscribers,
-          avatarUrl: cachedData.avatar_url,
-          description: cachedData.description,
-          bannerUrl: cachedData.banner_url,
-          isVerified: cachedData.is_verified,
-          updatedAt: cachedData.updated_at
-        }
-      });
-    }
+    console.error(
+      "YouTube API Error:",
+      error
+    );
 
     return sendJson(res, 500, {
       status: "error",
