@@ -1,57 +1,97 @@
-const express = require('express');
+
 const { createClient } = require('@supabase/supabase-js');
-const { channel } = require('@vreden/youtube_scraper');
+const youtube = require('@vreden/youtube_scraper');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-app.use(express.json());
+let supabase = null;
 
-// 環境変数からSupabase接続情報を取得
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("エラー: 環境変数 SUPABASE_URL と SUPABASE_SERVICE_ROLE_KEY を設定してください。");
-  process.exit(1);
+if (supabaseUrl && supabaseKey) {
+  supabase = createClient(supabaseUrl, supabaseKey);
 }
 
-// サービスロールキー（管理権限）を使用してクライアントを初期化
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-// キャッシュの有効期限 (24時間)
 const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000;
 
-/**
- * チャンネルプロフィール取得・キャッシュAPI
- * GET /api/channel?url=https://youtube.com
- */
-app.get('/api/channel', async (req, res) => {
-  const channelUrl = req.query.url;
+module.exports = async (req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
-  if (!channelUrl) {
-    return res.status(400).json({
+  if (req.method !== 'GET') {
+    return res.status(405).json({
       status: 'error',
-      message: 'クエリパラメータ "url" を指定してください。'
+      message: 'GET only'
     });
   }
 
-  // URLから一意の識別子を抽出 (例: @Google)
-  const channelKey = channelUrl.split('/').pop() || channelUrl;
-
   try {
-    // 1. Supabaseからキャッシュデータを検索
-    const { data: cachedData, error: dbError } = await supabase
-      .from('youtube_channels')
-      .select('*')
-      .eq('id', channelKey)
-      .single();
+    // 環境変数チェック
+    if (!supabase) {
+      return res.status(500).json({
+        status: 'error',
+        message: 'Supabase environment variables are missing'
+      });
+    }
 
-    const now = new Date();
+    const channelUrl = req.query.url;
 
-    // キャッシュが存在し、かつ24時間以内であればDBのデータを返却
-    if (cachedData && (now - new Date(cachedData.updated_at) < CACHE_EXPIRATION_MS)) {
-      return res.json({
+    if (!channelUrl || typeof channelUrl !== 'string') {
+      return res.status(400).json({
+        status: 'error',
+        message: 'url parameter is required'
+      });
+    }
+
+    let parsedUrl;
+
+    try {
+      parsedUrl = new URL(channelUrl);
+    } catch {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Invalid YouTube URL'
+      });
+    }
+
+    if (
+      !['youtube.com', 'www.youtube.com', 'm.youtube.com',
+        'youtu.be'].includes(parsedUrl.hostname)
+    ) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Invalid YouTube domain'
+      });
+    }
+
+    const channelKey = parsedUrl.pathname
+      .split('/')
+      .filter(Boolean)
+      .pop();
+
+    if (!channelKey) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Invalid channel URL'
+      });
+    }
+
+    // キャッシュ検索
+    const { data: cachedData, error: cacheError } =
+      await supabase
+        .from('youtube_channels')
+        .select('*')
+        .eq('id', channelKey)
+        .maybeSingle();
+
+    if (cacheError) {
+      console.error('Supabase cache error:', cacheError);
+    }
+
+    if (
+      cachedData &&
+      Date.now() - new Date(cachedData.updated_at).getTime()
+        < CACHE_EXPIRATION_MS
+    ) {
+      return res.status(200).json({
         status: 'success',
         source: 'database_cache',
         data: {
@@ -66,21 +106,30 @@ app.get('/api/channel', async (req, res) => {
       });
     }
 
-    // 2. キャッシュがない、または期限切れの場合は新しくスクレイピングを実行
-    console.log(`YouTubeから最新のプロフィールを取得中: ${channelKey}`);
-    const scraped = await channel(channelUrl);
+    // YouTube情報取得
+    if (typeof youtube.channel !== 'function') {
+      throw new Error(
+        'youtube.channel is not available in installed package'
+      );
+    }
+
+    const scraped = await youtube.channel(channelUrl);
+
+    if (!scraped || !scraped.title) {
+      throw new Error('YouTube channel data is empty');
+    }
 
     const profileData = {
       channelName: scraped.title,
-      subscribers: scraped.subscribers,
-      avatarUrl: scraped.avatar,
-      description: scraped.description,
-      bannerUrl: scraped.banner || null,
-      isVerified: scraped.verified || false
+      subscribers: scraped.subscribers ?? null,
+      avatarUrl: scraped.avatar ?? null,
+      description: scraped.description ?? null,
+      bannerUrl: scraped.banner ?? null,
+      isVerified: scraped.verified ?? false
     };
 
-    // 3. サービスロールキー権限でデータをデータベースに永続化 (Upsert)
-    const { error: upsertError } = await supabase
+    // Supabase保存
+    const { error: saveError } = await supabase
       .from('youtube_channels')
       .upsert({
         id: channelKey,
@@ -93,27 +142,22 @@ app.get('/api/channel', async (req, res) => {
         updated_at: new Date().toISOString()
       });
 
-    if (upsertError) {
-      console.error('Supabaseへの保存失敗（サービスロールキー使用）:', upsertError);
+    if (saveError) {
+      console.error('Supabase save error:', saveError);
     }
 
-    return res.json({
+    return res.status(200).json({
       status: 'success',
       source: 'youtube_live',
       data: profileData
     });
 
   } catch (error) {
-    console.error('API Error:', error);
+    console.error('YouTube API Error:', error);
+
     return res.status(500).json({
       status: 'error',
-      message: 'データの取得または処理に失敗しました。',
-      error: error.message
+      message: error.message || 'Internal Server Error'
     });
   }
-});
-
-// サーバー起動
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+};
