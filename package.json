@@ -1,18 +1,13 @@
+
 {
   "name": "chanpro-gather-api",
   "version": "1.0.0",
   "private": true,
   "description": "YouTube Channel Information API",
-  "main": "api/YouTube-api.js",
-  "scripts": {
-    "start": "node api/YouTube-api.js",
-    "dev": "vercel dev",
-    "build": "echo Build skipped",
-    "typecheck": "echo TypeScript check skipped"
-  },
+  "scripts": {},
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
-    "@vreden/youtube_scraper": "1.1.2",
+    "@vreden/youtube_scraper": "^1.1.2",
     "express": "^4.19.2"
   }
 }
