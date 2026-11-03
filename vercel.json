@@ -1,5 +1,7 @@
 {
+  "version": 2,
   "regions": ["hnd1"],
+  "outputDirectory": null,
   "headers": [
     {
       "source": "/api/(.*)",
