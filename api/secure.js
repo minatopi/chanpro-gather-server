@@ -1,6 +1,10 @@
+process.noDeprecation=!0;
 const{createClient:createClient}=require("@supabase/supabase-js"),crypto=require("node:crypto"),SUPABASE_URL=process.env.SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY=process.env.SUPABASE_SERVICE_ROLE_KEY,IP_HASH_SECRET=process.env.IP_HASH_SECRET||process.env.SUPABASE_SERVICE_ROLE_KEY||"",POSTHOG_PROJECT_KEY=process.env.POSTHOG_PROJECT_KEY||"",SESSION_SECRET=process.env.SESSION_SECRET||process.env.SUPABASE_SERVICE_ROLE_KEY||"",POSTHOG_API_HOST=(process.env.POSTHOG_API_HOST||"https://us.i.posthog.com").replace(/\/$/,""),IP_RATE_LIMIT=Math.max(20,Number(process.env.IP_RATE_LIMIT||120)),IP_RATE_WINDOW_SECONDS=Math.max(60,Number(process.env.IP_RATE_WINDOW_SECONDS||300)),IP_BLOCK_SECONDS=Math.max(60,Number(process.env.IP_BLOCK_SECONDS||3600)),SERVER_COUNT_HASHTAGS=!0,STICKERS_URL=process.env.STICKERS_URL||"https://minatopi.github.io/chanpro-chat-edit/stickers.json",AXIOM_TOKEN=process.env.AXIOM_TOKEN||"",AXIOM_DATASET=process.env.AXIOM_DATASET||"chanpro";
 
-async function axiomLog(type,ip,props={}){if(AXIOM_TOKEN)try{await fetch(`https://api.axiom.co/v1/datasets/${AXIOM_DATASET}/ingest`,{method:"POST",headers:{Authorization:`Bearer ${AXIOM_TOKEN}`,"Content-Type":"application/json"},body:JSON.stringify([{_time:(new Date).toISOString(),source:"gather-api",type:type,ip:ip,...props}]),signal:AbortSignal.timeout(2500)})}catch(e){console.warn("Axiom log failed:",e?.message||e)}}
+const LOG_TIMEOUT_MS=8e3;
+function isTimeoutError(e){return"TimeoutError"===e?.name||"AbortError"===e?.name||/aborted due to timeout/i.test(String(e?.message||""))}
+
+async function axiomLog(type,ip,props={}){if(AXIOM_TOKEN)try{await fetch(`https://api.axiom.co/v1/datasets/${AXIOM_DATASET}/ingest`,{method:"POST",headers:{Authorization:`Bearer ${AXIOM_TOKEN}`,"Content-Type":"application/json"},body:JSON.stringify([{_time:(new Date).toISOString(),source:"gather-api",type:type,ip:ip,...props}]),signal:AbortSignal.timeout(LOG_TIMEOUT_MS)})}catch(e){isTimeoutError(e)||console.warn("Axiom log failed:",e?.message||e)}}
 
 async function isEnabled(db,key){const{data:data}=await db.from("app_settings").select("value").eq("key",key).maybeSingle();return!(data&&!1===data.value)}
 
@@ -14,7 +18,7 @@ function normalizeIp(ip){let value=String(ip||"").trim().toLowerCase();return va
 
 function hashIp(ip){if(!IP_HASH_SECRET)throw fail("IP_HASH_SECRET が未設定です",503);return sha256(IP_HASH_SECRET+":"+normalizeIp(ip))}
 
-async function sendPostHogSecurityEvent(event,ip,props={}){if(POSTHOG_PROJECT_KEY&&"function"==typeof fetch)try{await fetch(POSTHOG_API_HOST+"/capture/",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({api_key:POSTHOG_PROJECT_KEY,event:event,distinct_id:"chanpro-server-security",properties:{$ip:ip,$process_person_profile:!1,event_source:"chanpro-vercel-secure",...props}}),signal:AbortSignal.timeout(2500)})}catch(e){console.warn("PostHog security event could not be sent:",e?.message||e)}}
+async function sendPostHogSecurityEvent(event,ip,props={}){if(POSTHOG_PROJECT_KEY&&"function"==typeof fetch)try{await fetch(POSTHOG_API_HOST+"/capture/",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({api_key:POSTHOG_PROJECT_KEY,event:event,distinct_id:"chanpro-server-security",properties:{$ip:ip,$process_person_profile:!1,event_source:"chanpro-vercel-secure",...props}}),signal:AbortSignal.timeout(LOG_TIMEOUT_MS)})}catch(e){isTimeoutError(e)||console.warn("PostHog security event could not be sent:",e?.message||e)}}
 
 async function checkIpBan(db,ipHash,ip,action){const{data:data,error:error}=await db.from("banned_ip_addresses").select("reason,expires_at").eq("ip_hash",ipHash).maybeSingle();if(error)throw error;if(data&&(!data.expires_at||new Date(data.expires_at).getTime()>Date.now()))throw await sendPostHogSecurityEvent("chanpro_ip_banned_request",ip,{ip_hash:ipHash,action:action,reason:data.reason||"IP BAN"}),await axiomLog("ip_banned_request",ip,{ip_hash:ipHash,action:action,reason:data.reason||"IP BAN"}),fail(data.reason||"このIPアドレスからのアクセスは禁止されています",403)}
 
@@ -36,7 +40,7 @@ const USER_COLUMNS="id,username,password_hash,role,verified,ban_until,ban_count,
 
 async function authenticateSession(db,req){const session=readSession(req),{data:user,error:error}=await db.from("users").select(USER_COLUMNS).eq("id",session.sub).maybeSingle();if(error)throw error;if(!user)throw fail("ユーザーが見つかりません。再ログインしてください",401);if(user.ban_until&&new Date(user.ban_until).getTime()>Date.now())throw fail("このアカウントはBANされています",403);return delete user.password_hash,{user:user}}
 
-function client(req){if(!SUPABASE_URL||!SUPABASE_SERVICE_ROLE_KEY)throw new Error("Vercel環境変数が設定されていません");return createClient(SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,{auth:{persistSession:!1,autoRefreshToken:!1,detectSessionInUrl:!1}})}
+function client(req){if(!SUPABASE_URL||!SUPABASE_SERVICE_ROLE_KEY)throw new Error("Vercel環境変数が設定されていません");return createClient(SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,{auth:{persistSession:!1,autoRefreshToken:!1,detectSessionInUrl:!1},global:{fetch:(...args)=>fetch(...args)}})}
 
 function credentials(body){const username=String(body.username||"").trim(),password=String(body.password||"");if(!username||!password)throw fail("ユーザー名とパスワードを入力してください",400);if(username.length>100||password.length>1024)throw fail("入力が長すぎます",400);return{username:username,password:password}}
 
