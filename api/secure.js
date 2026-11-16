@@ -118,13 +118,15 @@ async function uploadImageToImgBB(db,payload,user,ip){
  const upstream=await fetch("https://api.imgbb.com/1/upload?key="+encodeURIComponent(IMGBB_API_KEY),{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:form.toString(),signal:AbortSignal.timeout(20000)});
  const result=await upstream.json().catch(()=>null);
  if(!upstream.ok||!result?.success||!result?.data?.url)throw fail(result?.error?.message||"ImgBBへの画像アップロードに失敗しました",502);
- const url=String(result.data.display_url||result.data.url),deleteUrl=result.data.delete_url?String(result.data.delete_url):null;
+ // 音声を埋め込んだPNGは、縮小・最適化されたdisplay_urlではなく、
+  // ImgBBが返す元画像URLを必ず使う。display_url側では画素データが変わり、A2P1ヘッダーが壊れる場合がある。
+  const url=String(result.data.url),displayUrl=String(result.data.display_url||result.data.url),deleteUrl=result.data.delete_url?String(result.data.delete_url):null;
  if(kind==="chat"){
   const {error}=await db.from("chat_image_assets").insert({user_id:user.id,image_url:url,delete_url:deleteUrl});
   if(error)console.warn("chat_image_assets登録失敗:",error.message);
  }
  await axiomLog("image_upload",ip,{user_id:String(user.id),username:user.username||null,kind:String(payload.kind||"post"),size_bytes:bytes.length,provider:"imgbb",filename:filename});
- return {ok:true,url:url,displayUrl:String(result.data.display_url||result.data.url),deleteUrl:deleteUrl,sizeBytes:bytes.length};
+ return {ok:true,url:url,displayUrl:displayUrl,deleteUrl:deleteUrl,sizeBytes:bytes.length};
 }
 
 
