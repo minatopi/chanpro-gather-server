@@ -11,6 +11,8 @@ const IMGBB_API_KEY = process.env.IMGBB_API_KEY || '';
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const AXIOM_TOKEN = process.env.AXIOM_TOKEN || '';
+const AXIOM_DATASET = process.env.AXIOM_DATASET || 'chanpro';
 
 let pool;
 let supabase;
@@ -378,27 +380,27 @@ async function handleImage(db, user, body) {
   return { ok: true, conversationId, message: { ...saved, id: String(saved.id) } };
 }
 
-let lastLogCleanupAt = 0;
-async function writeAiLog({ action, userId = null, status = 200, startedAt, error = null }) {
+const AXIOM_TIMEOUT_MS = 2500;
+async function writeAiLog({ action, userId = null, status = 200, startedAt, error = null, req = null }) {
+  if (!AXIOM_TOKEN) { console.warn('AI Axiom logging skipped: AXIOM_TOKEN is not configured'); return; }
+  const headers = req?.headers || {};
+  const latency = Math.max(0, Date.now() - Number(startedAt || Date.now()));
+  const event = {
+    _time: new Date().toISOString(), source: 'chanpro-ai-api', type: 'ai_api',
+    action: String(action || 'unknown').slice(0, 40), user_id: userId ? String(userId).slice(0, 64) : null,
+    http_status: Number(status) || 500, latency_ms: latency,
+    error_code: error?.code ? String(error.code).slice(0, 80) : null,
+    error_message: error ? String(error.message || 'AI API error').slice(0, 500) : null,
+    method: req?.method || null, user_agent: String(headers['user-agent'] || '').slice(0, 200) || null,
+    country: headers['x-vercel-ip-country'] || null, region: headers['x-vercel-ip-country-region'] || null
+  };
   try {
-    const db = getPool();
-    const latency = Math.max(0, Date.now() - Number(startedAt || Date.now()));
-    await db.execute(
-      `INSERT INTO ai_logs (action, user_id, http_status, latency_ms, error_code, error_message, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-      [String(action || 'unknown').slice(0, 40), userId ? String(userId).slice(0, 64) : null,
-       Number(status) || 500, latency, error?.code ? String(error.code).slice(0, 80) : null,
-       error ? String(error.message || 'AI API error').slice(0, 500) : null]
-    );
-    // 1日1回だけ、古いログを少量ずつ削除。毎回大量のDELETEをしない。
-    if (Date.now() - lastLogCleanupAt > 24 * 60 * 60 * 1000) {
-      lastLogCleanupAt = Date.now();
-      await db.execute('DELETE FROM ai_logs WHERE created_at < DATE_SUB(NOW(), INTERVAL 30 DAY) LIMIT 1000').catch(() => {});
-    }
-  } catch (logError) {
-    // ログ保存の失敗で本来のAI応答を失わない。Vercelログにも記録する。
-    console.warn('AI log save failed:', logError?.message || logError);
-  }
+    const response = await fetch(`https://api.axiom.co/v1/datasets/${encodeURIComponent(AXIOM_DATASET)}/ingest`, {
+      method: 'POST', headers: { Authorization: `Bearer ${AXIOM_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify([event]), signal: AbortSignal.timeout(AXIOM_TIMEOUT_MS)
+    });
+    if (!response.ok) console.warn('AI Axiom log failed:', response.status);
+  } catch (logError) { console.warn('AI Axiom log failed:', logError?.message || logError); }
 }
 
 module.exports = async (req, res) => {
@@ -410,13 +412,12 @@ module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only' });
+  if (req.method !== 'POST') {
+    const error = Object.assign(new Error('POST only'), { status: 405 });
+    await writeAiLog({ action, status: 405, startedAt, error, req });
+    return sendJson(res, 405, { ok: false, error: error.message });
+  }
   try {
-    if (req.method !== 'POST') {
-      const error = Object.assign(new Error('GET / POST only'), { status: 405 });
-      await writeAiLog({ action, status: 405, startedAt, error });
-      return sendJson(res, 405, { ok: false, error: error.message });
-    }
     const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
     action = String(body.action || 'unknown').slice(0, 40);
     user = await authenticate(req);
@@ -433,16 +434,16 @@ module.exports = async (req, res) => {
       case 'upload': result = await handleUpload(user, body); break;
       default: {
         const error = Object.assign(new Error('未対応のAI操作です'), { status: 400 });
-        await writeAiLog({ action, userId: user.id, status: 400, startedAt, error });
+        await writeAiLog({ action, userId: user.id, status: 400, startedAt, error, req });
         return sendJson(res, 400, { ok: false, error: error.message });
       }
     }
-    await writeAiLog({ action, userId: user.id, status: 200, startedAt });
+    await writeAiLog({ action, userId: user.id, status: 200, startedAt, req });
     return sendJson(res, 200, result);
   } catch (error) {
     const status = Number(error.status) || 500;
     console.error('AI API error:', error?.message || error);
-    await writeAiLog({ action, userId: user?.id || null, status, startedAt, error });
+    await writeAiLog({ action, userId: user?.id || null, status, startedAt, error, req });
     return sendJson(res, status, { ok: false, error: error.message || 'AI処理に失敗しました' });
   }
 };
