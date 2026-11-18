@@ -1,598 +1,96 @@
-
 /**
- * ChanPro Production Status API
- * Read-only monitoring API.
+ * Independent ChanPro status API. Does not import or modify api/secure.js.
  * Deploy at chanpro-gather-server/api/status.js
- *
- * GET  /api/status?action=health
- * GET  /api/status?action=dashboard
- * GET  /api/status?action=dashboard&days=7
  */
 "use strict";
-
-const E = process.env;
-
-const BASE = (E.SUPABASE_URL || "").replace(/\/+$/, "");
-const KEY = E.SUPABASE_SERVICE_ROLE_KEY || "";
-const AXIOM = E.AXIOM_TOKEN || "";
-const DATASET = E.AXIOM_DATASET || "chanpro";
-const METRICS =
-  E.STATUS_METRICS_URL ||
-  "https://minatopi.github.io/chanpro-gather-surveillance/metrics.json";
-
-const configuredTimeout = Number(E.STATUS_TEST_TIMEOUT_MS || 8000);
-const TIMEOUT = Number.isFinite(configuredTimeout)
-  ? Math.max(2000, Math.min(15000, configuredTimeout))
-  : 8000;
-
-const FEATURES = [
-  ["post", "投稿"],
-  ["reply", "返信"],
-  ["read", "投稿・返信の読み込み"],
-  ["delete", "投稿・返信の削除"],
-  ["image", "画像アップロード"],
-  ["pin", "投稿固定"],
-  ["like", "いいね"],
-  ["repost", "リポスト"],
-  ["bookmark", "ブックマーク"],
-  ["poll", "投票"],
-  ["follow", "フォロー"],
-  ["report", "通報"],
-  ["dm_send", "DM送信"],
-  ["dm_read", "DM読み込み"],
-  ["chat", "チャット"],
-  ["notification", "通知"],
-  ["developer_msg", "運営メッセージ"],
-  ["points_send", "ポイント送信"],
-  ["stamp", "スタンプ"],
-  ["bonus", "ログイン・継続ボーナス"],
-  ["profile", "プロフィール・設定"],
-  ["account_delete", "アカウント削除"]
+const E=process.env;
+const AXIOM=E.AXIOM_TOKEN||"",DATASET=E.AXIOM_DATASET||"chanpro";
+const TIMEOUT=8000;
+const FEATURES=[
+["post","投稿"],["reply","返信"],["read","投稿・返信の読み込み"],["delete","投稿・返信の削除"],["image","画像アップロード"],["pin","投稿固定"],["like","いいね"],["repost","リポスト"],["bookmark","ブックマーク"],["poll","投票"],["follow","フォロー"],["report","通報"],["dm_send","DM送信"],["dm_read","DM読み込み"],["chat","チャット"],["notification","通知"],["developer_msg","運営メッセージ"],["points_send","ポイント送信"],["stamp","スタンプ"],["bonus","ログイン・継続ボーナス"],["profile","プロフィール・設定"],["account_delete","アカウント削除"]
 ];
-
-const ACTIONS = {
-  "post-create": "post",
-  "reply-create": "reply",
-  "post-read": "read",
-  "reply-list": "read",
-  "reply-prefetch": "read",
-  "limited-post-list": "read",
-  "post-view": "read",
-
-  "post-delete": "delete",
-  "reply-delete": "delete",
-
-  "image-upload": "image",
-  "image-register": "image",
-
-  "post-pin": "pin",
-  "post-like-toggle": "like",
-  "repost-toggle": "repost",
-  "bookmark-toggle": "bookmark",
-  "poll-vote": "poll",
-  "follow-toggle": "follow",
-
-  "report": "report",
-  "report-create": "report",
-
-  "dm-send": "dm_send",
-  "dm-list": "dm_read",
-  "dm-get": "dm_read",
-
-  "chat-history-add": "chat",
-  "chat-history-delete": "chat",
-  "chat-pins-save": "chat",
-
-  "notifications-read": "notification",
-
-  "developer-inbox-send": "developer_msg",
-  "developer-message-read": "developer_msg",
-
-  "transfer-points": "points_send",
-  "stamp-purchase": "stamp",
-
-  "user-login-streak": "bonus",
-  "weekly-points": "bonus",
-  "chat-points": "bonus",
-
-  "user-update": "profile",
-  "profile-music-save": "profile",
-  "user-settings": "profile",
-
-  "account-delete": "account_delete"
+const ACTIONS={
+"post-create":"post","reply-create":"reply","post-read":"read","reply-list":"read","reply-prefetch":"read","limited-post-list":"read","post-view":"read",
+"post-delete":"delete","reply-delete":"delete","image-upload":"image","image-register":"image","post-pin":"pin","post-like-toggle":"like","repost-toggle":"repost","bookmark-toggle":"bookmark","poll-vote":"poll","follow-toggle":"follow","report":"report","report-create":"report",
+"dm-send":"dm_send","dm-list":"dm_read","dm-get":"dm_read","chat-history-add":"chat","chat-history-delete":"chat","chat-pins-save":"chat","notifications-read":"notification","developer-inbox-send":"developer_msg","developer-message-read":"developer_msg",
+"transfer-points":"points_send","stamp-purchase":"stamp","user-login-streak":"bonus","weekly-points":"bonus","chat-points":"bonus","user-update":"profile","profile-music-save":"profile","user-settings":"profile","account-delete":"account_delete"
 };
-
-const clean = (value, max = 300) =>
-  String(value ?? "")
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .slice(0, max);
-
-function output(res, status, data) {
-  res.status(status);
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store, max-age=0");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("Referrer-Policy", "no-referrer");
-  res.end(JSON.stringify(data));
+const clean=(v,n=300)=>String(v??"").replace(/[\u0000-\u001f\u007f]/g," ").slice(0,n);
+function out(res,status,data){res.status(status);res.setHeader("Content-Type","application/json; charset=utf-8");res.setHeader("Cache-Control","no-store");res.setHeader("X-Content-Type-Options","nosniff");res.end(JSON.stringify(data))}
+async function get(url,opt={},ms=TIMEOUT){
+ const c=new AbortController(),t=setTimeout(()=>c.abort(),ms);
+ try{const r=await fetch(url,{...opt,signal:c.signal});const s=await r.text();let d;try{d=s?JSON.parse(s):null}catch(_){d={message:s.slice(0,250)}}if(!r.ok)throw Error(clean(d?.message||d?.details||`HTTP ${r.status}`));return d}finally{clearTimeout(t)}
 }
-
-async function get(url, options = {}, timeout = TIMEOUT) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
-
-    const body = await response.text();
-
-    let data;
-
-    try {
-      data = body ? JSON.parse(body) : null;
-    } catch (_) {
-      data = { message: body.slice(0, 250) };
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        clean(
-          data?.message ||
-          data?.details ||
-          `HTTP ${response.status}`
-        )
-      );
-    }
-
-    return data;
-  } finally {
-    clearTimeout(timer);
-  }
+async function queryAxiom(apl){
+ if(!AXIOM)throw Error("AXIOM_TOKEN が未設定です");
+ const d=await get("https://api.axiom.co/v1/datasets/_apl?format=legacy",{method:"POST",headers:{Authorization:`Bearer ${AXIOM}`,"Content-Type":"application/json"},body:JSON.stringify({apl})});
+ if(Array.isArray(d.matches))return d.matches.map(x=>({_time:x._time,...(x.data||{})}));
+ const t=d.tables?.[0];if(!t?.fields||!t?.columns)return [];
+ return Array.from({length:(t.columns[0]||[]).length},(_,i)=>{const o={};t.fields.forEach((f,j)=>o[f.name]=t.columns[j]?.[i]);return o});
 }
-
-async function sb(path, options = {}) {
-  if (!BASE || !KEY) {
-    throw new Error("Supabase環境変数が未設定です");
+const ms=v=>{const n=new Date(v).getTime();return Number.isFinite(n)?n:0};
+const labelTime=t=>new Date(t).toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",month:"2-digit",day:"2-digit",hour:"2-digit"});
+function featureOf(row){return ACTIONS[String(row.action||"")]||String(row.feature||"")}
+// These messages describe an expected user-side rejection, not a service failure.
+const USER_ERROR_RE=/(すでに投票|既に投票|投票済み|already\s+voted|password.{0,20}(incorrect|wrong|invalid)|username.{0,20}(incorrect|wrong|invalid)|invalid.{0,20}(credentials|password|username)|ユーザー名.{0,20}(違|正しくない|間違)|パスワード.{0,20}(違|正しくない|間違)|ユーザー名またはパスワード|入力.{0,15}(不正|不足)|必須項目|重複しています|duplicate.{0,20}(vote|entry)|validation.{0,20}(error|failed))/i;
+function isUserCaused(row){
+ const message=[row.message,row.error,row.error_message,row.reason,row.details,row.response].filter(Boolean).join(" ");
+ return USER_ERROR_RE.test(String(message));
+}
+function classify(row){
+ if(isUserCaused(row))return null;
+ if(row.type==="feature_blocked")return "blocked";
+ if(row.type==="feature_status")return ["正常","稼働中","ok","healthy","up"].includes(String(row.status||"").toLowerCase())||["正常","稼働中"].includes(String(row.status||""))?"normal":"blocked";
+ if(row.type==="api_error")return "error";
+ if(row.type==="access")return Number(row.status||200)>=400?"error":"normal";
+ return null;
+}
+async function dashboard(days){
+ const logs=await queryAxiom(`['${DATASET.replace(/'/g,"''")}'] | where _time > ago(${days}d) | where type in ("access","api_error","feature_blocked","feature_status") | sort by _time desc | take 5000`);
+ const map=new Map(FEATURES.map(([key,name])=>[key,{key,name,requests:0,errors:0,blocked:0,latencies:[],last_seen:null,last_state:"normal",last_state_time:0,last_message:""}]));
+ const events=[];
+ for(const r of logs){
+  const key=featureOf(r),s=map.get(key);if(!s)continue;
+  const time=ms(r._time),tm=time?new Date(time).toISOString():null;
+  if(!s.last_seen||time>ms(s.last_seen))s.last_seen=tm;
+  const state=classify(r);
+  if(state===null)continue;
+  if(["access","api_error"].includes(r.type)){
+   s.requests++;
+   if(state==="error")s.errors++;
+   if(r.type==="access"&&state==="normal"){
+    const n=Number(r.ms??r.duration_ms);if(Number.isFinite(n)&&n>=0)s.latencies.push(n);
+   }
   }
-
-  return get(`${BASE}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: KEY,
-      Authorization: `Bearer ${KEY}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {})
-    }
+  if(state==="blocked")s.blocked++;
+  if(time>=s.last_state_time){
+   s.last_state=state;s.last_state_time=time;
+   s.last_message=state==="normal"?"":clean(r.message||r.error||r.reason||r.status|| (state==="blocked"?"機能停止の記録":"APIエラー"));
+  }
+  if(state==="error")events.push({time:tm,feature:key,feature_name:s.name,kind:"error",message:clean(r.message||r.error||r.error_message||r.action||"APIエラー")});
+  if(state==="blocked")events.push({time:tm,feature:key,feature_name:s.name,kind:"blocked",message:clean(r.message||r.reason||r.status||"機能停止")});
+ }
+ const features=[...map.values()].map(s=>{
+  const rate=s.requests?((s.requests-s.errors)/s.requests)*100:null;
+  const state=s.last_state==="blocked"?"停止":s.last_state==="error"?"不具合":"正常";
+  const count=Math.min(48,Math.max(12,days*4));
+  const buckets=Array.from({length:count},(_,i)=>{
+   const span=days*86400000/count,from=Date.now()-days*86400000+i*span,to=from+span;
+   const rs=logs.filter(r=>featureOf(r)===s.key&&["access","api_error"].includes(r.type)&&!isUserCaused(r)&&ms(r._time)>=from&&ms(r._time)<to);
+   const bad=rs.filter(r=>classify(r)==="error"),lat=rs.filter(r=>r.type==="access"&&classify(r)==="normal").map(r=>Number(r.ms??r.duration_ms)).filter(n=>Number.isFinite(n)&&n>=0);
+   return {label:labelTime(from),success_rate:rs.length?(rs.length-bad.length)/rs.length*100:null,avg_ms:lat.length?lat.reduce((a,b)=>a+b,0)/lat.length:null};
   });
+  return {key:s.key,name:s.name,requests:s.requests,errors:s.errors,blocked:s.blocked,success_rate:rate,avg_ms:s.latencies.length?s.latencies.reduce((a,b)=>a+b,0)/s.latencies.length:null,last_seen:s.last_seen,state,message:s.last_message,buckets};
+ });
+ events.sort((a,b)=>ms(b.time)-ms(a.time));
+ return {ok:true,generated_at:new Date().toISOString(),features,events:events.slice(0,300)};
 }
-
-async function queryAxiom(apl) {
-  if (!AXIOM) {
-    throw new Error("AXIOM_TOKEN が未設定です");
-  }
-
-  const data = await get(
-    "https://api.axiom.co/v1/datasets/_apl?format=legacy",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${AXIOM}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ apl })
-    }
-  );
-
-  if (Array.isArray(data.matches)) {
-    return data.matches.map(item => ({
-      _time: item._time,
-      ...(item.data || {})
-    }));
-  }
-
-  const table = data.tables?.[0];
-
-  if (!table?.fields || !table?.columns) {
-    return [];
-  }
-
-  const count = (table.columns[0] || []).length;
-
-  return Array.from({ length: count }, (_, index) => {
-    const row = {};
-
-    table.fields.forEach((field, column) => {
-      row[field.name] = table.columns[column]?.[index];
-    });
-
-    return row;
-  });
-}
-
-function timestamp(value) {
-  const result = new Date(value).getTime();
-  return Number.isFinite(result) ? result : 0;
-}
-
-function labelTime(value) {
-  return new Date(value).toLocaleString("ja-JP", {
-    timeZone: "Asia/Tokyo",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit"
-  });
-}
-
-function featureOf(row) {
-  return ACTIONS[String(row.action || "")] ||
-    String(row.feature || "");
-}
-
-function createBucket() {
-  return {
-    requests: 0,
-    errors: 0,
-    latency_total: 0,
-    latency_count: 0
-  };
-}
-
-async function dashboard(days) {
-  if (!AXIOM) {
-    throw new Error("AXIOM_TOKEN が未設定です");
-  }
-
-  const dataset = DATASET.replace(/'/g, "''");
-
-  const logs = await queryAxiom(
-    `['${dataset}']` +
-    ` | where _time > ago(${days}d)` +
-    ` | where type in ("access","api_error","feature_blocked","feature_status")` +
-    ` | sort by _time desc` +
-    ` | take 5000`
-  );
-
-  const bucketCount = Math.min(
-    48,
-    Math.max(12, days * 4)
-  );
-
-  const now = Date.now();
-  const period = days * 86400000;
-  const interval = period / bucketCount;
-  const start = now - period;
-
-  const map = new Map();
-
-  for (const [key, name] of FEATURES) {
-    map.set(key, {
-      key,
-      name,
-      requests: 0,
-      errors: 0,
-      blocked: 0,
-      latencies: [],
-      last_seen: null,
-      buckets: Array.from(
-        { length: bucketCount },
-        () => createBucket()
-      )
-    });
-  }
-
-  const events = [];
-
-  for (const row of logs) {
-    const key = featureOf(row);
-    const feature = map.get(key);
-
-    if (!feature) continue;
-
-    const time = timestamp(row._time);
-
-    const isoTime = time
-      ? new Date(time).toISOString()
-      : null;
-
-    if (
-      !feature.last_seen ||
-      time > timestamp(feature.last_seen)
-    ) {
-      feature.last_seen = isoTime;
-    }
-
-    if (row.type === "access") {
-      feature.requests++;
-
-      const status = Number(row.status ?? 200);
-      const failed = status >= 400;
-
-      if (failed) {
-        feature.errors++;
-      }
-
-      const latency = Number(
-        row.ms ?? row.duration_ms
-      );
-
-      if (Number.isFinite(latency) && latency >= 0) {
-        feature.latencies.push(latency);
-      }
-
-      if (time >= start && time < now) {
-        const index = Math.min(
-          bucketCount - 1,
-          Math.floor((time - start) / interval)
-        );
-
-        const bucket = feature.buckets[index];
-
-        bucket.requests++;
-
-        if (failed) {
-          bucket.errors++;
-        }
-
-        if (
-          Number.isFinite(latency) &&
-          latency >= 0
-        ) {
-          bucket.latency_total += latency;
-          bucket.latency_count++;
-        }
-      }
-    }
-
-    if (row.type === "api_error") {
-      feature.requests++;
-      feature.errors++;
-
-      events.push({
-        time: isoTime,
-        feature: key,
-        feature_name: feature.name,
-        kind: "error",
-        message: clean(
-          row.message ||
-          row.error ||
-          row.action ||
-          "APIエラー"
-        )
-      });
-
-      if (time >= start && time < now) {
-        const index = Math.min(
-          bucketCount - 1,
-          Math.floor((time - start) / interval)
-        );
-
-        const bucket = feature.buckets[index];
-
-        bucket.requests++;
-        bucket.errors++;
-      }
-    }
-
-    if (row.type === "feature_blocked") {
-      feature.blocked++;
-
-      events.push({
-        time: isoTime,
-        feature: key,
-        feature_name: feature.name,
-        kind: "blocked",
-        message: clean(
-          row.message ||
-          row.reason ||
-          "機能停止"
-        )
-      });
-    }
-
-    if (
-      row.type === "feature_status" &&
-      !["正常", "稼働中"].includes(row.status)
-    ) {
-      events.push({
-        time: isoTime,
-        feature: key,
-        feature_name: feature.name,
-        kind: "blocked",
-        message: clean(
-          row.message ||
-          row.status ||
-          "状態異常"
-        )
-      });
-    }
-  }
-
-  const features = [...map.values()].map(feature => {
-    const requests = feature.requests;
-    const errors = feature.errors;
-
-    const successRate = requests > 0
-      ? ((requests - errors) / requests) * 100
-      : null;
-
-    /*
-     * 判定ルール
-     *
-     * 停止ログあり         => 停止
-     * リクエスト0件        => データ不足
-     * 1件以上・95%未満     => 不具合
-     * 1件以上・99%未満     => 注意
-     * 1件以上・99%以上     => 正常
-     */
-
-    let state;
-
-    if (feature.blocked > 0) {
-      state = "停止";
-    } else if (requests === 0) {
-      state = "データ不足";
-    } else if (successRate < 95) {
-      state = "不具合";
-    } else if (successRate < 99) {
-      state = "注意";
-    } else {
-      state = "正常";
-    }
-
-    const buckets = feature.buckets.map(
-      (bucket, index) => {
-        const from = start + index * interval;
-
-        return {
-          label: labelTime(from),
-
-          success_rate: bucket.requests > 0
-            ? (
-                (bucket.requests - bucket.errors) /
-                bucket.requests
-              ) * 100
-            : null,
-
-          avg_ms: bucket.latency_count > 0
-            ? bucket.latency_total /
-              bucket.latency_count
-            : null,
-
-          requests: bucket.requests,
-          errors: bucket.errors
-        };
-      }
-    );
-
-    const avgMs = feature.latencies.length > 0
-      ? feature.latencies.reduce(
-          (total, value) => total + value,
-          0
-        ) / feature.latencies.length
-      : null;
-
-    return {
-      key: feature.key,
-      name: feature.name,
-
-      requests,
-      errors,
-      blocked: feature.blocked,
-
-      success_rate: successRate,
-      avg_ms: avgMs,
-
-      last_seen: feature.last_seen,
-
-      state,
-
-      message: feature.blocked
-        ? "停止ログあり"
-        : errors > 0
-          ? "APIエラー記録あり"
-          : "",
-
-      buckets
-    };
-  });
-
-  events.sort(
-    (a, b) => timestamp(b.time) - timestamp(a.time)
-  );
-
-  return {
-    ok: true,
-    generated_at: new Date().toISOString(),
-    period_days: days,
-    total_features: features.length,
-
-    summary: {
-      normal: features.filter(
-        x => x.state === "正常"
-      ).length,
-
-      warning: features.filter(
-        x => x.state === "注意"
-      ).length,
-
-      error: features.filter(
-        x => x.state === "不具合"
-      ).length,
-
-      stopped: features.filter(
-        x => x.state === "停止"
-      ).length,
-
-      insufficient: features.filter(
-        x => x.state === "データ不足"
-      ).length
-    },
-
-    features,
-    events: events.slice(0, 300)
-  };
-}
-
-module.exports = async function(req, res) {
-  try {
-    const action = String(
-      req.query?.action || "dashboard"
-    );
-
-    if (req.method === "OPTIONS") {
-      res.setHeader("Allow", "GET, OPTIONS");
-      return res.status(204).end();
-    }
-
-    if (
-      req.method === "GET" &&
-      action === "health"
-    ) {
-      return output(res, 200, {
-        ok: true,
-        service: "chanpro-status-api",
-        time: new Date().toISOString()
-      });
-    }
-
-    if (
-      req.method === "GET" &&
-      action === "dashboard"
-    ) {
-      const requestedDays = Number(
-        req.query?.days ?? 30
-      );
-
-      const days = Number.isFinite(requestedDays)
-        ? Math.max(1, Math.min(30, Math.floor(requestedDays)))
-        : 30;
-
-      const result = await dashboard(days);
-
-      return output(res, 200, result);
-    }
-
-    res.setHeader("Allow", "GET, OPTIONS");
-
-    return output(res, 405, {
-      ok: false,
-      error: "許可されていない操作です"
-    });
-
-  } catch (error) {
-    return output(
-      res,
-      500,
-      {
-        ok: false,
-        error: clean(
-          error?.message || "内部サーバーエラー",
-          500
-        )
-      }
-    );
-  }
+module.exports=async function(req,res){
+ try{
+  const action=String(req.query?.action||"dashboard");
+  if(req.method==="OPTIONS"){res.setHeader("Allow","GET, OPTIONS");return res.status(204).end()}
+  if(req.method==="GET"&&action==="health")return out(res,200,{ok:true,service:"chanpro-status-api",time:new Date().toISOString()});
+  if(req.method==="GET"&&action==="dashboard"){const days=Math.max(1,Math.min(30,Number(req.query?.days||30)));return out(res,200,await dashboard(days))}
+  return out(res,405,{ok:false,error:"許可されていない操作です"});
+ }catch(e){return out(res,500,{ok:false,error:clean(e.message,500)})}
 };
