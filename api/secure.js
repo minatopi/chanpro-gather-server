@@ -101,8 +101,9 @@ function validateReadRequest(item,user,admin){
  const url=new URL(path,"https://supabase.invalid");
  const selected=url.searchParams.get("select")||"";
  if(table==="users"){
-  if(!selected||selected.includes("*")||/[(),]/.test(selected))throw fail("ユーザー情報の読み込み項目が許可されていません",403);
+  if(!selected||selected.includes("*"))throw fail("ユーザー情報の読み込み項目が許可されていません",403);
   const columns=selected.split(",").map(x=>x.trim().toLowerCase());
+  if(!columns.length||columns.some(x=>! /^[a-z_][a-z0-9_]*$/.test(x)))throw fail("ユーザー情報の読み込み項目が許可されていません",403);
   if(columns.some(x=>ALWAYS_PRIVATE_USER_COLUMNS.has(x))||(!admin&&columns.some(x=>ADMIN_USER_COLUMNS.has(x))))throw fail("非公開のユーザー情報は読み込めません",403);
   if(columns.some(x=>SELF_ONLY_USER_COLUMNS.has(x))&&!admin&&url.searchParams.get("id")!==`eq.${user.id}`)throw fail("非公開のユーザー設定は本人のみ取得できます",403);
  }
