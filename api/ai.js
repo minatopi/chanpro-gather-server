@@ -11,12 +11,68 @@ const IMGBB_API_KEY = process.env.IMGBB_API_KEY || '';
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const IP_HASH_SECRET = process.env.IP_HASH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const AXIOM_TOKEN = process.env.AXIOM_TOKEN || '';
 const AXIOM_DATASET = process.env.AXIOM_DATASET || 'chanpro';
 
 let pool;
 let supabase;
 const requestWindows = new Map();
+
+/* ================= 管理サイト連携: 停止設定(app_settings) ================= */
+// 管理サイトの「停止設定」と同じキー: server_enabled(全通信を拒否) / feature_ai_chat / feature_ai_image / feature_ai_upload
+// admin / developer は機能停止の対象外(サーバー全体の停止は全員が対象)
+const AI_FEATURES = {
+  ai_chat: { label: 'AIチャット', actions: ['chat', 'history', 'list', 'delete', 'settings', 'save-settings'] },
+  ai_image: { label: 'AI画像生成', actions: ['image'] },
+  ai_upload: { label: 'AI用の画像送信', actions: ['upload'] }
+};
+const FEATURE_OF_ACTION = {};
+for (const [key, f] of Object.entries(AI_FEATURES)) for (const a of f.actions) FEATURE_OF_ACTION[a] = key;
+
+let settingsCache = { at: 0, map: new Map() };
+async function getSettings() {
+  if (Date.now() - settingsCache.at < 5000) return settingsCache.map;
+  const sb = getSupabase();
+  if (!sb) return settingsCache.map;
+  try {
+    const { data, error } = await sb.from('app_settings').select('key,value');
+    if (error) throw error;
+    settingsCache = { at: Date.now(), map: new Map((data || []).map(r => [r.key, r.value])) };
+  } catch (e) {
+    settingsCache.at = Date.now() - 3000; // 取得に失敗したら数秒後に再試行。失敗時は「稼働中」として扱う
+    console.warn('app_settings read failed:', e?.message || e);
+  }
+  return settingsCache.map;
+}
+const isOn = (map, key) => !(map.has(key) && map.get(key) === false);
+const textSetting = (map, key, fallback) => (typeof map.get(key) === 'string' && map.get(key)) || fallback;
+
+function getClientIp(req) {
+  const real = req.headers['x-real-ip'];
+  const forwarded = req.headers['x-forwarded-for'];
+  const raw = (Array.isArray(real) ? real[0] : real) || (Array.isArray(forwarded) ? forwarded[0] : String(forwarded || '').split(',')[0]);
+  const ip = String(raw || '').trim().replace(/^\[|\]$/g, '');
+  return ip && ip.length <= 100 && /^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(ip) ? ip : 'unknown';
+}
+function normalizeIp(ip) {
+  let value = String(ip || '').trim().toLowerCase();
+  if (value.startsWith('::ffff:')) value = value.slice(7);
+  return value;
+}
+function hashIp(ip) {
+  return crypto.createHash('sha256').update(IP_HASH_SECRET + ':' + normalizeIp(ip), 'utf8').digest('hex');
+}
+// BAN中のIPからはAI機能も使えない(secure.js と同じ banned_ip_addresses を参照)
+async function assertIpNotBanned(ip) {
+  const sb = getSupabase();
+  if (!sb || !IP_HASH_SECRET || ip === 'unknown') return;
+  const { data, error } = await sb.from('banned_ip_addresses').select('reason,expires_at').eq('ip_hash', hashIp(ip)).maybeSingle();
+  if (error) { console.warn('ip ban check failed:', error.message); return; }
+  if (data && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now())) {
+    throw Object.assign(new Error(data.reason || 'このIPアドレスからのアクセスは禁止されています'), { status: 403, code: 'ip_banned', event: 'ip_banned_request' });
+  }
+}
 
 function getPool() {
   if (!process.env.TIDB_HOST || !process.env.TIDB_USER || !process.env.TIDB_PASSWORD || !process.env.TIDB_DATABASE) {
@@ -113,7 +169,7 @@ function rateLimit(userId, kind) {
     throw Object.assign(new Error(kind === 'image'
       ? '画像生成の回数制限に達しました。しばらく待ってから再度お試しください'
       : kind === 'upload' ? '画像の送信回数が多すぎます。しばらく待ってください'
-      : '送信回数が多すぎます。少し待ってから再度お試しください'), { status: 429 });
+      : '送信回数が多すぎます。少し待ってから再度お試しください'), { status: 429, code: 'rate_limited' });
   }
   current.count++;
   requestWindows.set(key, current);
@@ -262,12 +318,13 @@ async function handleDeleteConversation(db, user, body) {
   return { ok: true, deleted: true, conversationId: String(conversation.id) };
 }
 
-async function handleChat(db, user, body) {
+async function handleChat(db, user, body, ctx) {
   rateLimit(user.id, 'chat');
   const message = String(body.message || '').trim();
   const imageUrl = body.imageUrl ? validateImgBBUrl(body.imageUrl) : null;
   if (!message && !imageUrl) throw Object.assign(new Error('メッセージまたは画像を入力してください'), { status: 400 });
   if (message.length > 12000) throw Object.assign(new Error('メッセージは12,000文字以内にしてください'), { status: 400 });
+  ctx.extra = { message_length: message.length, has_image: !!imageUrl, new_conversation: !body.conversationId };
   let conversationId;
   if (body.conversationId) {
     const conversation = await getOwnedConversation(db, body.conversationId, user.id);
@@ -293,6 +350,9 @@ async function handleChat(db, user, body) {
   const answer = await callOpenAIChat(history, user, settingsRows[0]?.system_prompt || '');
   const saved = await saveMessage(db, { conversationId, userId: user.id, role: 'assistant', content: answer });
   await updateConversationTime(db, conversationId, user.id);
+  ctx.extra.answer_length = answer.length;
+  // 画像つきの質問は、管理サイトで画像を確認できるようログにURLを残す
+  if (imageUrl) ctx.images.push({ kind: 'upload', url: imageUrl, via: 'chat' });
   return {
     ok: true, conversationId,
     userMessage: { ...userMessage, id: String(userMessage.id) },
@@ -324,13 +384,14 @@ async function uploadToImgBB(base64, maxBytes = 3 * 1024 * 1024) {
     throw Object.assign(new Error(data?.error?.message || 'ImgBBへの画像保存に失敗しました'), { status: 502 });
   }
   // display_urlではなく、画像データをそのまま取得できる元URLを保存する
-  return String(data.data.url);
+  return { url: String(data.data.url), deleteUrl: data.data.delete_url ? String(data.data.delete_url) : null, size: bytes.length };
 }
 
-async function handleUpload(user, body) {
+async function handleUpload(user, body, ctx) {
   rateLimit(user.id, 'upload');
-  const imageUrl = await uploadToImgBB(body.imageBase64);
-  return { ok: true, imageUrl };
+  const up = await uploadToImgBB(body.imageBase64);
+  ctx.images.push({ kind: 'upload', url: up.url, delete_url: up.deleteUrl, size_bytes: up.size, via: 'upload' });
+  return { ok: true, imageUrl: up.url };
 }
 
 async function callOpenAIImage(prompt, user) {
@@ -352,16 +413,17 @@ async function callOpenAIImage(prompt, user) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = data?.error?.message || `画像生成APIエラー (${response.status})`;
-    throw Object.assign(new Error(message), { status: response.status === 429 ? 429 : 502 });
+    throw Object.assign(new Error(message), { status: response.status === 429 ? 429 : 502, code: data?.error?.code || `openai_image_${response.status}` });
   }
   const base64 = data?.data?.[0]?.b64_json;
   if (typeof base64 !== 'string' || !base64) throw Object.assign(new Error('画像生成結果を取得できませんでした'), { status: 502 });
   return uploadToImgBB(base64, 8 * 1024 * 1024);
 }
 
-async function handleImage(db, user, body) {
+async function handleImage(db, user, body, ctx) {
   rateLimit(user.id, 'image');
   const prompt = cleanText(body.prompt, 3000, '画像の説明');
+  ctx.extra = { prompt_length: prompt.length };
   let conversationId;
   if (body.conversationId) {
     const conversation = await getOwnedConversation(db, body.conversationId, user.id);
@@ -370,82 +432,127 @@ async function handleImage(db, user, body) {
     conversationId = await createConversation(db, user, `画像生成: ${prompt.slice(0, 65)}`);
   }
   await saveMessage(db, { conversationId, userId: user.id, role: 'user', content: `画像生成: ${prompt}` });
-  const imageUrl = await callOpenAIImage(prompt, user);
+  const generated = await callOpenAIImage(prompt, user);
+  const imageUrl = generated.url;
   const saved = await saveMessage(db, {
     conversationId, userId: user.id, role: 'assistant', messageType: 'image',
     content: `画像を生成し、ImgBBに保存しました。\n内容: ${prompt}`,
     imageUrl
   });
   await updateConversationTime(db, conversationId, user.id);
+  ctx.images.push({ kind: 'generated', url: imageUrl, delete_url: generated.deleteUrl, size_bytes: generated.size, via: 'image', prompt: prompt.slice(0, 200) });
   return { ok: true, conversationId, message: { ...saved, id: String(saved.id) } };
 }
 
+/* ================= Axiom ログ(管理サイトの「AI利用」「画像」で表示) ================= */
 const AXIOM_TIMEOUT_MS = 2500;
-async function writeAiLog({ action, userId = null, status = 200, startedAt, error = null, req = null }) {
+const blockedLogSeen = new Map();
+
+async function ingestAxiom(events) {
   if (!AXIOM_TOKEN) { console.warn('AI Axiom logging skipped: AXIOM_TOKEN is not configured'); return; }
-  const headers = req?.headers || {};
-  const latency = Math.max(0, Date.now() - Number(startedAt || Date.now()));
-  const event = {
-    _time: new Date().toISOString(), source: 'chanpro-ai-api', type: 'ai_api',
-    action: String(action || 'unknown').slice(0, 40), user_id: userId ? String(userId).slice(0, 64) : null,
-    http_status: Number(status) || 500, latency_ms: latency,
-    error_code: error?.code ? String(error.code).slice(0, 80) : null,
-    error_message: error ? String(error.message || 'AI API error').slice(0, 500) : null,
-    method: req?.method || null, user_agent: String(headers['user-agent'] || '').slice(0, 200) || null,
-    country: headers['x-vercel-ip-country'] || null, region: headers['x-vercel-ip-country-region'] || null
-  };
+  if (!events.length) return;
   try {
     const response = await fetch(`https://api.axiom.co/v1/datasets/${encodeURIComponent(AXIOM_DATASET)}/ingest`, {
       method: 'POST', headers: { Authorization: `Bearer ${AXIOM_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify([event]), signal: AbortSignal.timeout(AXIOM_TIMEOUT_MS)
+      body: JSON.stringify(events), signal: AbortSignal.timeout(AXIOM_TIMEOUT_MS)
     });
     if (!response.ok) console.warn('AI Axiom log failed:', response.status);
   } catch (logError) { console.warn('AI Axiom log failed:', logError?.message || logError); }
 }
 
+// レスポンスを返した後に実行する(ユーザーを待たせない)
+async function writeAiLogs({ ctx, status, startedAt, error, req }) {
+  const headers = req?.headers || {};
+  const latency = Math.max(0, Date.now() - Number(startedAt || Date.now()));
+  const now = new Date().toISOString();
+  const place = {
+    country: headers['x-vercel-ip-country'] || null, region: headers['x-vercel-ip-country-region'] || null,
+    city: (() => { try { return headers['x-vercel-ip-city'] ? decodeURIComponent(headers['x-vercel-ip-city']) : null; } catch (_) { return null; } })()
+  };
+  const who = { user_id: ctx.user?.id ? String(ctx.user.id).slice(0, 64) : null, username: ctx.user?.username || null };
+  const events = [{
+    _time: now, source: 'chanpro-ai-api', type: 'ai_api',
+    action: String(ctx.action || 'unknown').slice(0, 40), ...who, ip: ctx.ip || null,
+    http_status: Number(status) || 500, latency_ms: latency, ms: latency,
+    error_code: error?.code ? String(error.code).slice(0, 80) : null,
+    error_message: error ? String(error.message || 'AI API error').slice(0, 500) : null,
+    method: req?.method || null, user_agent: String(headers['user-agent'] || '').slice(0, 200) || null,
+    ...place, ...(ctx.extra || {})
+  }];
+  if (error?.event === 'ip_banned_request') events.push({ _time: now, source: 'chanpro-ai-api', type: 'ip_banned_request', ip: ctx.ip, action: `ai:${ctx.action}`, reason: String(error.message).slice(0, 200), ...place });
+  if (error?.feature) {
+    const seenKey = `${ctx.user?.id || ctx.ip}|${error.feature}`;
+    if ((blockedLogSeen.get(seenKey) || 0) < Date.now() - 60000) {
+      blockedLogSeen.set(seenKey, Date.now()); if (blockedLogSeen.size > 3000) blockedLogSeen.clear();
+      events.push({ _time: now, source: 'chanpro-ai-api', type: 'feature_blocked', feature: error.feature, feature_label: AI_FEATURES[error.feature]?.label || error.feature, action: `ai:${ctx.action}`, ip: ctx.ip, ...who, ...place });
+    }
+  }
+  if (error?.maintenance) {
+    const seenKey = 'server';
+    if ((blockedLogSeen.get(seenKey) || 0) < Date.now() - 30000) { blockedLogSeen.set(seenKey, Date.now()); events.push({ _time: now, source: 'chanpro-ai-api', type: 'server_blocked', action: `ai:${ctx.action}`, reason: 'server_disabled', ip: ctx.ip, ...place }); }
+  }
+  for (const image of ctx.images || []) {
+    events.push({ _time: now, source: 'chanpro-ai-api', type: 'ai_image_upload', ...who, ip: ctx.ip, kind: image.kind, via: image.via, url: image.url, delete_url: image.delete_url || undefined, size_bytes: image.size_bytes || undefined, prompt: image.prompt || undefined });
+  }
+  await ingestAxiom(events);
+}
+
 module.exports = async (req, res) => {
   const startedAt = Date.now();
-  let action = 'unknown';
-  let user = null;
+  const ctx = { action: 'unknown', user: null, ip: getClientIp(req), extra: null, images: [] };
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST') {
-    const error = Object.assign(new Error('POST only'), { status: 405 });
-    await writeAiLog({ action, status: 405, startedAt, error, req });
-    return sendJson(res, 405, { ok: false, error: error.message });
-  }
+
+  let status = 200;
+  let payload = null;
+  let error = null;
   try {
+    if (req.method !== 'POST') throw Object.assign(new Error('POST only'), { status: 405 });
     const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
-    action = String(body.action || 'unknown').slice(0, 40);
-    user = await authenticate(req);
-    const db = getPool();
-    let result;
-    switch (action) {
-      case 'list': result = await handleList(db, user); break;
-      case 'settings': result = await handleGetSettings(db, user); break;
-      case 'save-settings': result = await handleSaveSettings(db, user, body); break;
-      case 'delete': result = await handleDeleteConversation(db, user, body); break;
-      case 'history': result = await handleHistory(db, user, body); break;
-      case 'chat': result = await handleChat(db, user, body); break;
-      case 'image': result = await handleImage(db, user, body); break;
-      case 'upload': result = await handleUpload(user, body); break;
-      default: {
-        const error = Object.assign(new Error('未対応のAI操作です'), { status: 400 });
-        await writeAiLog({ action, userId: user.id, status: 400, startedAt, error, req });
-        return sendJson(res, 400, { ok: false, error: error.message });
-      }
+    ctx.action = String(body.action || 'unknown').slice(0, 40);
+
+    // 1) サーバー全体の停止(管理サイトの「停止設定」)
+    const settings = await getSettings();
+    if (!isOn(settings, 'server_enabled')) {
+      res.setHeader('Retry-After', '60');
+      throw Object.assign(new Error(textSetting(settings, 'server_disabled_message', '現在サーバーを停止しています。しばらくしてからもう一度お試しください')), { status: 503, code: 'server_disabled', maintenance: true });
     }
-    await writeAiLog({ action, userId: user.id, status: 200, startedAt, req });
-    return sendJson(res, 200, result);
-  } catch (error) {
-    const status = Number(error.status) || 500;
-    console.error('AI API error:', error?.message || error);
-    await writeAiLog({ action, userId: user?.id || null, status, startedAt, error, req });
-    return sendJson(res, status, { ok: false, error: error.message || 'AI処理に失敗しました' });
+    // 2) IP BAN
+    await assertIpNotBanned(ctx.ip);
+    // 3) 認証(BAN中のアカウントは拒否)
+    ctx.user = await authenticate(req);
+    // 4) 機能ごとの停止(admin / developer は対象外)
+    const featureKey = FEATURE_OF_ACTION[ctx.action];
+    if (featureKey && !['admin', 'developer'].includes(ctx.user.role) && !isOn(settings, `feature_${featureKey}`)) {
+      throw Object.assign(new Error(textSetting(settings, `feature_${featureKey}_message`, `現在、「${AI_FEATURES[featureKey].label}」機能を停止しています。しばらくしてからもう一度お試しください`)), { status: 503, code: 'feature_disabled', feature: featureKey });
+    }
+
+    const user = ctx.user;
+    const db = getPool();
+    switch (ctx.action) {
+      case 'list': payload = await handleList(db, user); break;
+      case 'settings': payload = await handleGetSettings(db, user); break;
+      case 'save-settings': payload = await handleSaveSettings(db, user, body); break;
+      case 'delete': payload = await handleDeleteConversation(db, user, body); break;
+      case 'history': payload = await handleHistory(db, user, body); break;
+      case 'chat': payload = await handleChat(db, user, body, ctx); break;
+      case 'image': payload = await handleImage(db, user, body, ctx); break;
+      case 'upload': payload = await handleUpload(user, body, ctx); break;
+      default: throw Object.assign(new Error('未対応のAI操作です'), { status: 400 });
+    }
+  } catch (e) {
+    error = e;
+    status = Number(e.status) || 500;
+    if (!e.maintenance && !e.feature && e.code !== 'ip_banned') console.error('AI API error:', e?.message || e);
+    payload = { ok: false, error: e.message || 'AI処理に失敗しました' };
+    if (e.feature) payload.feature = e.feature;
+    if (e.maintenance) payload.maintenance = true;
   }
+  sendJson(res, status, payload);
+  await writeAiLogs({ ctx, status, startedAt, error, req });
 };
 
 module.exports.config = { api: { bodyParser: { sizeLimit: '5mb' } } };
