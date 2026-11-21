@@ -199,11 +199,12 @@ async function getOwnedConversation(db, conversationId, userId) {
 }
 
 async function createConversation(db, user, title) {
+  const name = String(title || '新しいチャット').replace(/\s+/g, ' ').slice(0, 80) || '新しいチャット';
   const [result] = await db.execute(
     'INSERT INTO ai_conversations (user_id, title, created_at, updated_at) VALUES (?, ?, NOW(), NOW())',
-    [user.id, String(title || '新しいチャット').replace(/\s+/g, ' ').slice(0, 80) || '新しいチャット']
+    [user.id, name]
   );
-  return String(result.insertId);
+  return { id: String(result.insertId), title: name };
 }
 
 async function saveMessage(db, { conversationId, userId, role, messageType = 'text', content = '', imageUrl = null }) {
@@ -249,7 +250,7 @@ async function handleHistory(db, user, body) {
   return { ok: true, conversation: { ...conversation, id: String(conversation.id) }, messages: rows.map(row => ({ ...row, id: String(row.id) })) };
 }
 
-async function callOpenAIChat(messages, user, customSystemPrompt = '') {
+async function callOpenAIChat(messages, user, customSystemPrompt, signal) {
   if (!OPENAI_API_KEY) throw Object.assign(new Error('Vercel環境変数 OPENAI_API_KEY が設定されていません'), { status: 503 });
   const formatted = messages.map(row => {
     if (row.image_url) {
@@ -273,9 +274,12 @@ async function callOpenAIChat(messages, user, customSystemPrompt = '') {
       store: false,
       user: crypto.createHash('sha256').update(String(user.id)).digest('hex').slice(0, 64)
     }),
-    signal: AbortSignal.timeout(90000)
+    signal
   });
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json().catch(error => {
+    if (signal?.aborted || error.name === 'AbortError' || error.name === 'TimeoutError') throw error;
+    return {};
+  });
   if (!response.ok) {
     const message = data?.error?.message || `OpenAI APIエラー (${response.status})`;
     throw Object.assign(new Error(message), { status: response.status === 429 ? 429 : 502, code: data?.error?.code || `openai_${response.status}` });
@@ -325,42 +329,43 @@ async function handleChat(db, user, body, ctx) {
   if (!message && !imageUrl) throw Object.assign(new Error('メッセージまたは画像を入力してください'), { status: 400 });
   if (message.length > 12000) throw Object.assign(new Error('メッセージは12,000文字以内にしてください'), { status: 400 });
   ctx.extra = { message_length: message.length, has_image: !!imageUrl, new_conversation: !body.conversationId };
-  let conversationId;
+  let conversation;
   if (body.conversationId) {
-    const conversation = await getOwnedConversation(db, body.conversationId, user.id);
-    conversationId = String(conversation.id);
+    conversation = await getOwnedConversation(db, body.conversationId, user.id);
   } else {
-    conversationId = await createConversation(db, user, (message || '画像について').slice(0, 80));
+    conversation = await createConversation(db, user, (message || '画像について').slice(0, 80));
   }
+  const conversationId = String(conversation.id);
+  const conversationSummary = { id: conversationId, title: conversation.title };
+  ctx.extra.conversation_id = conversationId;
   const userMessage = await saveMessage(db, {
     conversationId, userId: user.id, role: 'user',
     messageType: imageUrl ? 'image' : 'text',
     content: message || 'この画像について教えてください。', imageUrl
   });
+  ctx.savedInput = { conversation: conversationSummary, message: { ...userMessage, id: String(userMessage.id) } };
   // 直近12件だけをAIへ渡す。古い会話全体を毎回読み込まないことでDB負荷を抑える。
-  const [history] = await db.execute(
+  const [[history], [settingsRows]] = await Promise.all([db.execute(
     `SELECT role, message_type, content, image_url FROM (
        SELECT role, message_type, content, image_url, id FROM ai_messages
         WHERE conversation_id = ? AND user_id = ?
         ORDER BY id DESC LIMIT 12
      ) recent ORDER BY id ASC`,
     [conversationId, user.id]
-  );
-  const [settingsRows] = await db.execute('SELECT system_prompt FROM ai_user_settings WHERE user_id = ? LIMIT 1', [user.id]);
-  const answer = await callOpenAIChat(history, user, settingsRows[0]?.system_prompt || '');
+  ), db.execute('SELECT system_prompt FROM ai_user_settings WHERE user_id = ? LIMIT 1', [user.id])]);
+  if (imageUrl) ctx.images.push({ kind: 'upload', url: imageUrl, via: 'chat' });
+  const answer = await callOpenAIChat(history, user, settingsRows[0]?.system_prompt || '', ctx.signal);
   const saved = await saveMessage(db, { conversationId, userId: user.id, role: 'assistant', content: answer });
   await updateConversationTime(db, conversationId, user.id);
   ctx.extra.answer_length = answer.length;
-  // 画像つきの質問は、管理サイトで画像を確認できるようログにURLを残す
-  if (imageUrl) ctx.images.push({ kind: 'upload', url: imageUrl, via: 'chat' });
   return {
-    ok: true, conversationId,
-    userMessage: { ...userMessage, id: String(userMessage.id) },
+    ok: true, conversationId, conversation: conversationSummary,
+    userMessage: ctx.savedInput.message,
     message: { ...saved, id: String(saved.id) }
   };
 }
 
-async function uploadToImgBB(base64, maxBytes = 3 * 1024 * 1024) {
+async function uploadToImgBB(base64, signal, maxBytes = 3 * 1024 * 1024) {
   if (!IMGBB_API_KEY) throw Object.assign(new Error('Vercel環境変数 IMGBB_API_KEY が設定されていません'), { status: 503 });
   const clean = String(base64 || '').replace(/^data:image\/[a-z0-9.+-]+;base64,/i, '').replace(/\s/g, '');
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) throw Object.assign(new Error('画像データが不正です'), { status: 400 });
@@ -377,9 +382,12 @@ async function uploadToImgBB(base64, maxBytes = 3 * 1024 * 1024) {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString(),
-    signal: AbortSignal.timeout(45000)
+    signal: AbortSignal.any([signal, AbortSignal.timeout(45000)])
   });
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json().catch(error => {
+    if (signal?.aborted || error.name === 'AbortError' || error.name === 'TimeoutError') throw error;
+    return {};
+  });
   if (!response.ok || !data?.success || !data?.data?.url) {
     throw Object.assign(new Error(data?.error?.message || 'ImgBBへの画像保存に失敗しました'), { status: 502 });
   }
@@ -389,12 +397,12 @@ async function uploadToImgBB(base64, maxBytes = 3 * 1024 * 1024) {
 
 async function handleUpload(user, body, ctx) {
   rateLimit(user.id, 'upload');
-  const up = await uploadToImgBB(body.imageBase64);
+  const up = await uploadToImgBB(body.imageBase64, ctx.signal);
   ctx.images.push({ kind: 'upload', url: up.url, delete_url: up.deleteUrl, size_bytes: up.size, via: 'upload' });
   return { ok: true, imageUrl: up.url };
 }
 
-async function callOpenAIImage(prompt, user) {
+async function callOpenAIImage(prompt, user, signal) {
   if (!OPENAI_API_KEY) throw Object.assign(new Error('Vercel環境変数 OPENAI_API_KEY が設定されていません'), { status: 503 });
   const response = await fetch('https://api.openai.com/v1/images/generations', {
     method: 'POST',
@@ -408,40 +416,46 @@ async function callOpenAIImage(prompt, user) {
       output_format: 'png',
       safety_identifier: crypto.createHash('sha256').update(String(user.id)).digest('hex').slice(0, 64)
     }),
-    signal: AbortSignal.timeout(180000)
+    signal: AbortSignal.any([signal, AbortSignal.timeout(180000)])
   });
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json().catch(error => {
+    if (signal?.aborted || error.name === 'AbortError' || error.name === 'TimeoutError') throw error;
+    return {};
+  });
   if (!response.ok) {
     const message = data?.error?.message || `画像生成APIエラー (${response.status})`;
     throw Object.assign(new Error(message), { status: response.status === 429 ? 429 : 502, code: data?.error?.code || `openai_image_${response.status}` });
   }
   const base64 = data?.data?.[0]?.b64_json;
   if (typeof base64 !== 'string' || !base64) throw Object.assign(new Error('画像生成結果を取得できませんでした'), { status: 502 });
-  return uploadToImgBB(base64, 8 * 1024 * 1024);
+  return uploadToImgBB(base64, signal, 8 * 1024 * 1024);
 }
 
 async function handleImage(db, user, body, ctx) {
   rateLimit(user.id, 'image');
   const prompt = cleanText(body.prompt, 3000, '画像の説明');
   ctx.extra = { prompt_length: prompt.length };
-  let conversationId;
+  let conversation;
   if (body.conversationId) {
-    const conversation = await getOwnedConversation(db, body.conversationId, user.id);
-    conversationId = String(conversation.id);
+    conversation = await getOwnedConversation(db, body.conversationId, user.id);
   } else {
-    conversationId = await createConversation(db, user, `画像生成: ${prompt.slice(0, 65)}`);
+    conversation = await createConversation(db, user, `画像生成: ${prompt.slice(0, 65)}`);
   }
-  await saveMessage(db, { conversationId, userId: user.id, role: 'user', content: `画像生成: ${prompt}` });
-  const generated = await callOpenAIImage(prompt, user);
+  const conversationId = String(conversation.id);
+  const conversationSummary = { id: conversationId, title: conversation.title };
+  ctx.extra.conversation_id = conversationId;
+  const userMessage = await saveMessage(db, { conversationId, userId: user.id, role: 'user', content: `画像生成: ${prompt}` });
+  ctx.savedInput = { conversation: conversationSummary, message: { ...userMessage, id: String(userMessage.id) } };
+  const generated = await callOpenAIImage(prompt, user, ctx.signal);
   const imageUrl = generated.url;
+  ctx.images.push({ kind: 'generated', url: imageUrl, delete_url: generated.deleteUrl, size_bytes: generated.size, via: 'image', prompt: prompt.slice(0, 200) });
   const saved = await saveMessage(db, {
     conversationId, userId: user.id, role: 'assistant', messageType: 'image',
     content: `画像を生成し、ImgBBに保存しました。\n内容: ${prompt}`,
     imageUrl
   });
   await updateConversationTime(db, conversationId, user.id);
-  ctx.images.push({ kind: 'generated', url: imageUrl, delete_url: generated.deleteUrl, size_bytes: generated.size, via: 'image', prompt: prompt.slice(0, 200) });
-  return { ok: true, conversationId, message: { ...saved, id: String(saved.id) } };
+  return { ok: true, conversationId, conversation: conversationSummary, userMessage: ctx.savedInput.message, message: { ...saved, id: String(saved.id) } };
 }
 
 /* ================= Axiom ログ(管理サイトの「AI利用」「画像」で表示) ================= */
@@ -473,6 +487,7 @@ async function writeAiLogs({ ctx, status, startedAt, error, req }) {
   const events = [{
     _time: now, source: 'chanpro-ai-api', type: 'ai_api',
     action: String(ctx.action || 'unknown').slice(0, 40), ...who, ip: ctx.ip || null,
+    request_id: headers['x-vercel-id'] || null,
     http_status: Number(status) || 500, latency_ms: latency, ms: latency,
     error_code: error?.code ? String(error.code).slice(0, 80) : null,
     error_message: error ? String(error.message || 'AI API error').slice(0, 500) : null,
@@ -513,17 +528,27 @@ module.exports = async (req, res) => {
     if (req.method !== 'POST') throw Object.assign(new Error('POST only'), { status: 405 });
     const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
     ctx.action = String(body.action || 'unknown').slice(0, 40);
+    const upstreamBudget = ctx.action === 'image' ? 215000 : 90000;
+    ctx.signal = AbortSignal.timeout(Math.max(1, upstreamBudget - (Date.now() - startedAt)));
+    if (['chat', 'image', 'upload'].includes(ctx.action)) {
+      console.info('AI request started', { action: ctx.action, requestId: req.headers['x-vercel-id'] });
+    }
 
     // 1) サーバー全体の停止(管理サイトの「停止設定」)
-    const settings = await getSettings();
+    const [settingsCheck, ipCheck, authCheck] = await Promise.allSettled([
+      getSettings(), assertIpNotBanned(ctx.ip), authenticate(req)
+    ]);
+    if (settingsCheck.status === 'rejected') throw settingsCheck.reason;
+    const settings = settingsCheck.value;
     if (!isOn(settings, 'server_enabled')) {
       res.setHeader('Retry-After', '60');
       throw Object.assign(new Error(textSetting(settings, 'server_disabled_message', '現在サーバーを停止しています。しばらくしてからもう一度お試しください')), { status: 503, code: 'server_disabled', maintenance: true });
     }
     // 2) IP BAN
-    await assertIpNotBanned(ctx.ip);
+    if (ipCheck.status === 'rejected') throw ipCheck.reason;
     // 3) 認証(BAN中のアカウントは拒否)
-    ctx.user = await authenticate(req);
+    if (authCheck.status === 'rejected') throw authCheck.reason;
+    ctx.user = authCheck.value;
     // 4) 機能ごとの停止(admin / developer は対象外)
     const featureKey = FEATURE_OF_ACTION[ctx.action];
     if (featureKey && !['admin', 'developer'].includes(ctx.user.role) && !isOn(settings, `feature_${featureKey}`)) {
@@ -544,15 +569,30 @@ module.exports = async (req, res) => {
       default: throw Object.assign(new Error('未対応のAI操作です'), { status: 400 });
     }
   } catch (e) {
+    const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+    if (timedOut) {
+      e = Object.assign(new Error('AI処理がタイムアウトしました。'), { status: 504, code: 'ai_upstream_timeout' });
+    }
     error = e;
     status = Number(e.status) || 500;
-    if (!e.maintenance && !e.feature && e.code !== 'ip_banned') console.error('AI API error:', e?.message || e);
+    if (!e.maintenance && !e.feature && e.code !== 'ip_banned') {
+      console.error('AI API error', {
+        action: ctx.action, status, code: e.code, requestId: req.headers['x-vercel-id'],
+        conversationId: ctx.extra?.conversation_id, latencyMs: Date.now() - startedAt,
+        message: e.message
+      });
+    }
     payload = { ok: false, error: e.message || 'AI処理に失敗しました' };
+    if (e.code) payload.code = e.code;
+    if (ctx.savedInput) payload.savedInput = ctx.savedInput;
     if (e.feature) payload.feature = e.feature;
     if (e.maintenance) payload.maintenance = true;
   }
-  sendJson(res, status, payload);
-  await writeAiLogs({ ctx, status, startedAt, error, req });
+  try {
+    await writeAiLogs({ ctx, status, startedAt, error, req });
+  } finally {
+    sendJson(res, status, payload);
+  }
 };
 
 module.exports.config = { api: { bodyParser: { sizeLimit: '5mb' } } };
