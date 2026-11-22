@@ -1,426 +1,671 @@
-process.noDeprecation=!0;
-const{createClient:createClient}=require("@supabase/supabase-js"),crypto=require("node:crypto"),SUPABASE_URL=process.env.SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY=process.env.SUPABASE_SERVICE_ROLE_KEY,SUPABASE_ANON_KEY=process.env.SUPABASE_ANON_KEY||"",IMGBB_API_KEY=process.env.IMGBB_API_KEY||"",IP_HASH_SECRET=process.env.IP_HASH_SECRET||process.env.SUPABASE_SERVICE_ROLE_KEY||"",POSTHOG_PROJECT_KEY=process.env.POSTHOG_PROJECT_KEY||"",SESSION_SECRET=process.env.SESSION_SECRET||process.env.SUPABASE_SERVICE_ROLE_KEY||"",POSTHOG_API_HOST=(process.env.POSTHOG_API_HOST||"https://us.i.posthog.com").replace(/\/$/,""),IP_RATE_LIMIT=Math.max(20,Number(process.env.IP_RATE_LIMIT||120)),IP_RATE_WINDOW_SECONDS=Math.max(60,Number(process.env.IP_RATE_WINDOW_SECONDS||300)),IP_BLOCK_SECONDS=Math.max(60,Number(process.env.IP_BLOCK_SECONDS||3600)),SERVER_COUNT_HASHTAGS=!0,STICKERS_URL=process.env.STICKERS_URL||"https://minatopi.github.io/chanpro-chat-edit/stickers.json",AXIOM_TOKEN=process.env.AXIOM_TOKEN||"",AXIOM_DATASET=process.env.AXIOM_DATASET||"chanpro";
+'use strict';
 
-const LOG_TIMEOUT_MS=2500;
-function isTimeoutError(e){return"TimeoutError"===e?.name||"AbortError"===e?.name||/aborted due to timeout/i.test(String(e?.message||""))}
+const mysql = require('mysql2/promise');
+const crypto = require('node:crypto');
+const { isIP } = require('node:net');
+const { createClient } = require('@supabase/supabase-js');
 
-/* ---- [管理サイト連携] Axiom ログ(リクエスト情報つき) ---- */
-const ipInfoCache=new Map;let lastBlockedLog=0;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || 'gpt-6-luna';
+const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2.6-flare';
+const IMGBB_API_KEY = process.env.IMGBB_API_KEY || '';
+const SESSION_SECRET = process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const IP_HASH_SECRET = process.env.IP_HASH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const AXIOM_TOKEN = process.env.AXIOM_TOKEN || '';
+const AXIOM_DATASET = process.env.AXIOM_DATASET || 'chanpro';
 
-function requestInfo(req){const h=req.headers||{},pick=k=>{const v=h[k];return Array.isArray(v)?v[0]:v},dec=v=>{try{return v?decodeURIComponent(v):void 0}catch(_){return v||void 0}};return{ua:String(pick("user-agent")||"").slice(0,200)||void 0,country:pick("x-vercel-ip-country")||void 0,region:pick("x-vercel-ip-country-region")||void 0,city:dec(pick("x-vercel-ip-city"))}}
+let pool;
+let supabase;
+const VOICES = new Set(['onyx', 'echo', 'nova', 'shimmer']);
+const EXPRESSIONS = new Set(['normal', 'happy', 'sad', 'angry', 'surprised', 'sleepy', 'wink']);
 
-async function axiomIngest(events){if(AXIOM_TOKEN&&events.length)try{await fetch(`https://api.axiom.co/v1/datasets/${AXIOM_DATASET}/ingest`,{method:"POST",headers:{Authorization:`Bearer ${AXIOM_TOKEN}`,"Content-Type":"application/json"},body:JSON.stringify(events),signal:AbortSignal.timeout(LOG_TIMEOUT_MS)})}catch(e){isTimeoutError(e)||console.warn("Axiom log failed:",e?.message||e)}}
+/* ================= 管理サイト連携: 停止設定(app_settings) ================= */
+// 管理サイトの「停止設定」と同じキー: server_enabled(全通信を拒否) / feature_ai_chat / feature_ai_image / feature_ai_upload
+// admin / developer は機能停止の対象外(サーバー全体の停止は全員が対象)
+const AI_FEATURES = {
+  ai_chat: { label: 'AIチャット', actions: ['chat', 'speech', 'history', 'list', 'delete', 'settings', 'save-settings'] },
+  ai_image: { label: 'AI画像生成', actions: ['image'] },
+  ai_upload: { label: 'AI用の画像送信', actions: ['upload'] }
+};
+const FEATURE_OF_ACTION = {};
+for (const [key, f] of Object.entries(AI_FEATURES)) for (const a of f.actions) FEATURE_OF_ACTION[a] = key;
 
-async function axiomLog(type,ip,props={}){return axiomIngest([{_time:(new Date).toISOString(),source:"gather-api",type:type,ip:ip,...ipInfoCache.get(ip)||{},...props}])}
-
-/* ---- [管理サイト連携] 停止設定(app_settings)。5秒キャッシュ、取得失敗時は「稼働中」とみなす ---- */
-let settingsCache={at:0,map:new Map};
-
-async function getSettings(db){if(Date.now()-settingsCache.at<5e3)return settingsCache.map;try{const{data:data,error:error}=await db.from("app_settings").select("key,value");if(error)throw error;settingsCache={at:Date.now(),map:new Map((data||[]).map(r=>[r.key,r.value]))}}catch(e){settingsCache.at=Date.now()-3e3,console.warn("app_settings read failed:",e?.message||e)}return settingsCache.map}
-
-async function isEnabled(db,key){const map=await getSettings(db);return!(map.has(key)&&!1===map.get(key))}
-
-async function settingMessage(db,key,fallback){const v=(await getSettings(db)).get(key);return"string"==typeof v&&v||fallback}
-
-async function getGate(db){return{enabled:await isEnabled(db,"server_enabled"),message:await settingMessage(db,"server_disabled_message","現在サーバーを停止しています。しばらくしてからもう一度お試しください")}}
-
-function fail(message,status=400){return Object.assign(new Error(message),{status:status})}
-
-function failR(message,status,reason){return Object.assign(fail(message,status),{reason:reason})}
-
-function getClientIp(req){const real=req.headers["x-real-ip"],forwarded=req.headers["x-forwarded-for"],raw=(Array.isArray(real)?real[0]:real)||(Array.isArray(forwarded)?forwarded[0]:String(forwarded||"").split(",")[0]),ip=String(raw||"").trim().replace(/^\[|\]$/g,"");if(!ip||ip.length>100||!/^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(ip))throw fail("接続元IPを確認できません。Vercelのx-real-ip設定を確認してください",503);return ip}
-
-function normalizeIp(ip){let value=String(ip||"").trim().toLowerCase();return value.startsWith("::ffff:")&&(value=value.slice(7)),value}
-
-function hashIp(ip){if(!IP_HASH_SECRET)throw fail("IP_HASH_SECRET が未設定です",503);return sha256(IP_HASH_SECRET+":"+normalizeIp(ip))}
-
-async function sendPostHogSecurityEvent(event,ip,props={}){if(POSTHOG_PROJECT_KEY&&"function"==typeof fetch)try{await fetch(POSTHOG_API_HOST+"/capture/",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({api_key:POSTHOG_PROJECT_KEY,event:event,distinct_id:"chanpro-server-security",properties:{$ip:ip,$process_person_profile:!1,event_source:"chanpro-vercel-secure",...props}}),signal:AbortSignal.timeout(LOG_TIMEOUT_MS)})}catch(e){isTimeoutError(e)||console.warn("PostHog security event could not be sent:",e?.message||e)}}
-
-async function checkIpBan(db,ipHash,ip,action){const{data:data,error:error}=await db.from("banned_ip_addresses").select("reason,expires_at").eq("ip_hash",ipHash).maybeSingle();if(error)throw error;if(data&&(!data.expires_at||new Date(data.expires_at).getTime()>Date.now()))throw await sendPostHogSecurityEvent("chanpro_ip_banned_request",ip,{ip_hash:ipHash,action:action,reason:data.reason||"IP BAN"}),await axiomLog("ip_banned_request",ip,{ip_hash:ipHash,action:action,reason:data.reason||"IP BAN"}),Object.assign(fail(data.reason||"このIPアドレスからのアクセスは禁止されています",403),{quiet:!0,reason:"ip_banned"})}
-
-async function checkDeviceBan(db,deviceHash,ip,action){if(!/^[a-f0-9]{32,128}$/i.test(String(deviceHash||"")))return;const key="device:"+String(deviceHash).toLowerCase(),{data:data,error:error}=await db.from("banned_ip_addresses").select("reason,expires_at").eq("ip_hash",key).maybeSingle();if(error)throw error;if(data&&(!data.expires_at||new Date(data.expires_at).getTime()>Date.now()))throw await axiomLog("device_banned_request",ip,{action:action,device_hash:String(deviceHash).slice(0,16),reason:data.reason||"DEVICE BAN"}),Object.assign(fail("この端末からのアクセスは禁止されています",403),{quiet:!0,reason:"device_banned"})}
-
-/* ---- [管理サイト連携] 現在BAN中のアカウントが使っている端末からは新規作成できない ---- */
-async function checkBannedAccountDevice(db,deviceHash){if(!/^[a-f0-9]{32,128}$/i.test(String(deviceHash||"")))return;const hashes=[...new Set([String(deviceHash),String(deviceHash).toLowerCase()])],{data:links,error:e1}=await db.from("user_devices").select("user_id").in("device_hash",hashes).limit(200);if(e1)throw e1;const ids=[...new Set((links||[]).map(l=>l.user_id).filter(Boolean))];if(!ids.length)return;const{data:banned,error:e2}=await db.from("users").select("id").in("id",ids).gt("ban_until",(new Date).toISOString()).limit(1);if(e2)throw e2;if(banned?.length)throw failR("この端末では新規アカウントを作成できません",403,"banned_device_account")}
-
-/* ---- [管理サイト連携] 機能ごとの停止(app_settings の feature_<key> = false)。admin / developer は対象外 ---- */
-const FEATURES=[["post","投稿の作成",["post-create"]],["image","画像アップロード",["image-upload","image-register"]],["read","読み込み(タイムライン・投稿閲覧)",["db-read-batch","profile-read","post-read","reply-list","reply-prefetch","limited-post-list","post-view"]],["delete","投稿・返信の削除",["post-delete","reply-delete"]],["pin","投稿の固定",["post-pin"]],["reply","返信",["reply-create"]],["like","いいね",["post-like-toggle"]],["repost","リポスト",["repost-toggle"]],["bookmark","ブックマーク",["bookmark-toggle"]],["poll","アンケート",["poll-vote"]],["follow","フォロー",["follow-toggle"]],["report","報告・通報",["report","report-create"]],["dm_send","DM送信",["dm-send"]],["dm_read","DM閲覧",["dm-list","dm-get"]],["chat","チャット",["chat-history-list","chat-history-add","chat-history-delete","chat-pins-save"]],["notification","通知",["notifications-read","notifications-cleanup"]],["developer_msg","開発者への連絡",["developer-inbox-send","developer-message-read"]],["points_send","ポイント送信",["transfer-points"]],["stamp","スタンプ購入",["stamp-purchase"]],["bonus","ポイント獲得",["user-login-streak","weekly-points","chat-points"]],["profile","プロフィール・設定の更新",["user-update","profile-music-save","user-settings"]],["account_delete","アカウント削除",["account-delete"]]],FEATURE_OF_ACTION=Object.fromEntries(FEATURES.flatMap(([k,,acts])=>acts.map(a=>[a,k]))),FEATURE_LABEL=Object.fromEntries(FEATURES.map(([k,l])=>[k,l])),featureLogSeen=new Map;
-
-async function assertFeature(db,ctx,key,user,ip){if(await isEnabled(db,"feature_"+key))return;const label=FEATURE_LABEL[key]||key,message=await settingMessage(db,"feature_"+key+"_message","現在、「"+label+"」機能を停止しています。しばらくしてからもう一度お試しください"),seenKey=(user?.id||ip)+"|"+key,now=Date.now();(featureLogSeen.get(seenKey)||0)<now-6e4&&(featureLogSeen.set(seenKey,now),featureLogSeen.size>3e3&&featureLogSeen.clear(),ctx.later.push(axiomLog("feature_blocked",ip,{feature:key,feature_label:label,action:ctx.action,user_id:user?.id?String(user.id):void 0,username:user?.username||void 0})));throw Object.assign(failR(message,503,"feature_disabled"),{quiet:!0,feature:key})}
-
-async function enforceIpRateLimit(db,ipHash){const{data:data,error:error}=await db.rpc("guard_ip_request",{p_ip_hash:ipHash,p_limit:IP_RATE_LIMIT,p_window_seconds:IP_RATE_WINDOW_SECONDS,p_block_seconds:IP_BLOCK_SECONDS});if(error)throw console.error("IP rate-limit RPC failed:",error.message||error),fail("IP制限の確認に失敗しました。SupabaseのセキュリティSQLを適用してください",503);const row=Array.isArray(data)?data[0]:data;if(row?.blocked)throw Object.assign(new Error(`アクセスが集中したため、このIPからのAPIアクセスを一時停止しています。約${Math.max(1,Math.ceil(Number(row.retry_after_seconds||3600)/60))}分後に再試行してください`),{status:429,retryAfter:Number(row.retry_after_seconds||3600),ipBlocked:!0,quiet:!0,reason:"rate_limited"})}
-
-function json(res,status,body){return res.__out={status:status,body:body},res.status(status).setHeader("Content-Type","application/json; charset=utf-8"),res.setHeader("Cache-Control","no-store"),res.end(JSON.stringify(body))}
-
-function sha256(value){return crypto.createHash("sha256").update(String(value),"utf8").digest("hex")}
-
-function safeEqual(a,b){const aa=Buffer.from(String(a||"")),bb=Buffer.from(String(b||""));return aa.length===bb.length&&crypto.timingSafeEqual(aa,bb)}
-
-function signSession(user){if(!SESSION_SECRET)throw fail("SESSION_SECRET が未設定です",503);const now=Math.floor(Date.now()/1e3),payload=Buffer.from(JSON.stringify({sub:String(user.id),username:String(user.username||""),iat:now,exp:now+604800,jti:crypto.randomUUID(),iss:"chanpro-gather"})).toString("base64url");return payload+"."+crypto.createHmac("sha256",SESSION_SECRET).update(payload).digest("base64url")}
-
-function readSession(req){const header=String(req.headers.authorization||""),token=header.startsWith("Bearer ")?header.slice(7).trim():"";if(!token||!SESSION_SECRET)throw fail("ログイン状態が切れました。再ログインしてください",401);const parts=token.split(".");if(2!==parts.length)throw fail("セッションが無効です",401);if(!safeEqual(crypto.createHmac("sha256",SESSION_SECRET).update(parts[0]).digest("base64url"),parts[1]))throw fail("セッションが無効です",401);let data;try{data=JSON.parse(Buffer.from(parts[0],"base64url").toString("utf8"))}catch(_){throw fail("セッションが無効です",401)}if("chanpro-gather"!==data.iss||!data.sub||Number(data.exp)<=Math.floor(Date.now()/1e3))throw fail("セッションの有効期限が切れました。再ログインしてください",401);return data}
-
-const USER_COLUMNS="id,username,password_hash,role,verified,ban_until,ban_count,icon_url,cover_url,profile,settings,program_urls,program_views,program_likes,profile_music,points,stamp_list,login_streak,last_login_date,consecutive_post_weeks,last_post_week";
-
-async function authenticateSession(db,req){const session=readSession(req),{data:user,error:error}=await db.from("users").select(USER_COLUMNS).eq("id",session.sub).maybeSingle();if(error)throw error;if(!user)throw fail("ユーザーが見つかりません。再ログインしてください",401);if(user.ban_until&&new Date(user.ban_until).getTime()>Date.now())throw fail("このアカウントはBANされています",403);return delete user.password_hash,{user:user}}
-
-function client(req){if(!SUPABASE_URL||!SUPABASE_SERVICE_ROLE_KEY)throw new Error("Vercel環境変数が設定されていません");return createClient(SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,{auth:{persistSession:!1,autoRefreshToken:!1,detectSessionInUrl:!1},global:{fetch:(...args)=>fetch(...args)}})}
-
-function credentials(body){const username=String(body.username||"").trim(),password=String(body.password||"");if(!username||!password)throw fail("ユーザー名とパスワードを入力してください",400);if(username.length>100||password.length>1024)throw fail("入力が長すぎます",400);return{username:username,password:password}}
-
-async function authenticate(db,body,{allowBanned:allowBanned=!1}={}){const{username:username,password:password}=credentials(body),{data:user,error:error}=await db.from("users").select(USER_COLUMNS).eq("username",username).maybeSingle();if(error)throw error;if(!user)throw failR("ユーザー名またはパスワードが違います",401,"user_not_found");if(!safeEqual(user.password_hash,sha256(password)))throw failR("ユーザー名またはパスワードが違います",401,"wrong_password");if(!allowBanned&&user.ban_until&&new Date(user.ban_until).getTime()>Date.now())throw failR("このアカウントはBANされています",403,"account_banned");return{user:user,password:password}}
-
-const ownUserFields=["icon_url","cover_url","profile","program_urls","profile_music"],settingFields=["home_chat_enabled","manual_chat_join","chat_sound_enabled","chat_theme","notification_volume","home_chat_width","post_notification_sound_enabled","ai_voice","ai_voice_auto_send","ai_voice_mode"],SAFE_ID=/^[A-Za-z0-9_-]{1,64}$/;
-
-function requireId(value,message="IDが不正です"){const s=String(null==value?"":value);if(!SAFE_ID.test(s))throw fail(message,400);return s}
-
-function canAccessPost(post,user,admin){return!post.is_limited||admin||!!user.verified||String(post.user_id)===String(user.id)}
-
-async function loadAccessiblePost(db,postId,user,admin,message="この投稿は操作できません"){const id=requireId(postId,"投稿IDがありません"),{data:post,error:error}=await db.from("posts").select("id,user_id,is_limited,poll").eq("id",id).maybeSingle();if(error)throw error;if(!post)throw fail("投稿が見つかりません",404);if(!canAccessPost(post,user,admin))throw fail(message,403);return post}
-
-function chunk(list,size){const out=[];for(let i=0;i<list.length;i+=size)out.push(list.slice(i,i+size));return out}
-const READ_PROXY_TABLES=new Set(["posts","users","notifications","follows","reposts","bookmarks","reports","hashtags","likes","poll_votes","replies","user_devices","chat_image_assets","messages","chat_device_bans","gather_reports","developer_messages","room_chat_history","chat_room_pins","developer_inbox","chat_rooms","banned_devices"]);
-const ADMIN_ONLY_READ_TABLES=new Set(["reports","gather_reports","chat_device_bans","banned_devices","developer_inbox"]);
-const ALWAYS_PRIVATE_USER_COLUMNS=new Set(["password_hash","auth_user_id"]);
-const ADMIN_USER_COLUMNS=new Set(["ip_list","last_login_ip","last_login_ip_address"]);
-const SELF_ONLY_USER_COLUMNS=new Set(["line_user_id","settings"]);
-function extractPostIds(filter){
- const value=String(filter||"");
- let m=value.match(/^eq\.([0-9a-f-]{36})$/i);if(m)return[m[1]];
- m=value.match(/^in\.\(([^)]+)\)$/i);if(m){const ids=m[1].split(",").map(x=>x.trim().replace(/^\"|\"$/g,""));return ids.length<=50&&ids.every(x=>/^[0-9a-f-]{36}$/i.test(x))?ids:[]}
- return [];
-}
-function validateReadRequest(item,user,admin){
- const method=String(item?.method||"GET").toUpperCase(),path=String(item?.path||"");
- if(!["GET","HEAD"].includes(method))throw fail("読み込みAPIではGET/HEADのみ利用できます",405);
- if(path.length>12000||!/^\/rest\/v1\/[A-Za-z_][A-Za-z0-9_]*(?:\?.*)?$/.test(path))throw fail("読み込み先が不正です",400);
- const table=path.slice(9).split("?")[0];
- if(!READ_PROXY_TABLES.has(table))throw fail("このテーブルの読み込みは許可されていません",403);
- if(!user?.id)throw fail("読み込みにはログインが必要です",401);
- if(ADMIN_ONLY_READ_TABLES.has(table)&&!admin)throw fail("この情報を閲覧する権限がありません",403);
- const url=new URL(path,"https://supabase.invalid");
- const selected=url.searchParams.get("select")||"";
- if(table==="users"){
-  if(!selected||selected.includes("*"))throw fail("ユーザー情報の読み込み項目が許可されていません",403);
-  const columns=selected.split(",").map(x=>x.trim().toLowerCase());
-  if(!columns.length||columns.some(x=>! /^[a-z_][a-z0-9_]*$/.test(x)))throw fail("ユーザー情報の読み込み項目が許可されていません",403);
-  if(columns.some(x=>ALWAYS_PRIVATE_USER_COLUMNS.has(x))||(!admin&&columns.some(x=>ADMIN_USER_COLUMNS.has(x))))throw fail("非公開のユーザー情報は読み込めません",403);
-  if(columns.some(x=>SELF_ONLY_USER_COLUMNS.has(x))&&!admin&&url.searchParams.get("id")!==`eq.${user.id}`)throw fail("非公開のユーザー設定は本人のみ取得できます",403);
- }
- // 自分の通知だけを返す。クライアント側で別ユーザーIDを指定しても上書きする。
- if(table==="notifications")url.searchParams.set("user_id",`eq.${user.id}`);
- if(table==="bookmarks")url.searchParams.set("user_id",`eq.${user.id}`);
- if(table==="user_devices"||table==="chat_image_assets")url.searchParams.set("user_id",`eq.${user.id}`);
- if(table==="developer_messages"&&!admin)url.searchParams.set("user_id",`eq.${user.id}`);
- if(table==="messages")url.searchParams.set("or",`(sender_id.eq.${user.id},receiver_id.eq.${user.id})`);
- // 未認証ユーザーは限定投稿を読めない。閲覧権限をクライアントの絞り込みに任せない。
- if(table==="posts"&&!user.verified&&!admin)url.searchParams.set("is_limited","eq.false");
- // 返信は親投稿IDを必須にし、親投稿の権限はproxyReadBatch内で再確認する。
- if(table==="replies"){
-  const ids=extractPostIds(url.searchParams.get("post_id"));
-  if(!ids.length)throw fail("返信の読み込みには投稿IDの指定が必要です",400);
- }
- const headers={apikey:SUPABASE_SERVICE_ROLE_KEY,Authorization:"Bearer "+SUPABASE_SERVICE_ROLE_KEY};
- for(const key of ["accept","accept-profile","content-profile","prefer","range","range-unit"])if(item?.headers?.[key])headers[key]=String(item.headers[key]).slice(0,500);
- return {method,path:url.pathname+url.search,table,url,headers};
-}
-const PROFILE_AUTHOR_COLUMNS = "id,username,icon_url,cover_url,profile,role,ban_until,program_urls,program_views,program_likes,verified,profile_music";
-const PROFILE_USER_COLUMNS = PROFILE_AUTHOR_COLUMNS + ",points,login_streak,consecutive_post_weeks,created_at";
-const PROFILE_POST_COLUMNS = "id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at";
-
-function profileResult(result) {
-  if (result.error) throw result.error;
-  return result.data;
-}
-
-async function profileRows(ids, makeQuery) {
-  const rows = [];
-  for (let start = 0; start < ids.length; start += 100) {
-    const batch = ids.slice(start, start + 100);
-    for (let offset = 0; ; offset += 500) {
-      const page = profileResult(await makeQuery(batch).range(offset, offset + 499));
-      rows.push(...page);
-      if (page.length < 500) break;
-    }
+let settingsCache = { at: 0, map: new Map() };
+async function getSettings() {
+  if (Date.now() - settingsCache.at < 5000) return settingsCache.map;
+  const sb = getSupabase();
+  if (!sb) return settingsCache.map;
+  try {
+    const { data, error } = await sb.from('app_settings').select('key,value');
+    if (error) throw error;
+    settingsCache = { at: Date.now(), map: new Map((data || []).map(r => [r.key, r.value])) };
+  } catch (e) {
+    settingsCache.at = Date.now() - 3000; // 取得に失敗したら数秒後に再試行。失敗時は「稼働中」として扱う
+    console.warn('app_settings read failed:', e?.message || e);
   }
-  return rows;
+  return settingsCache.map;
+}
+const isOn = (map, key) => !(map.has(key) && map.get(key) === false);
+const textSetting = (map, key, fallback) => (typeof map.get(key) === 'string' && map.get(key)) || fallback;
+
+function getClientIp(req) {
+  const headers = req.headers;
+  const raw = headers['x-vercel-forwarded-for'] || headers['x-real-ip'] || headers['x-forwarded-for'] || req.socket?.remoteAddress;
+  const ip = String(Array.isArray(raw) ? raw[0] : raw || '').split(',')[0].trim().replace(/^\[|\]$/g, '');
+  return isIP(ip) ? ip : 'unknown';
+}
+function normalizeIp(ip) {
+  let value = String(ip || '').trim().toLowerCase();
+  if (value.startsWith('::ffff:')) value = value.slice(7);
+  return value;
+}
+function hashIp(ip) {
+  return crypto.createHash('sha256').update(IP_HASH_SECRET + ':' + normalizeIp(ip), 'utf8').digest('hex');
+}
+// BAN中のIPからはAI機能も使えない(secure.js と同じ banned_ip_addresses を参照)
+async function assertIpNotBanned(ip) {
+  const sb = getSupabase();
+  if (!sb || !IP_HASH_SECRET || ip === 'unknown') return;
+  const { data, error } = await sb.from('banned_ip_addresses').select('reason,expires_at').eq('ip_hash', hashIp(ip)).maybeSingle();
+  if (error) { console.warn('ip ban check failed:', error.message); return; }
+  if (data && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now())) {
+    throw Object.assign(new Error(data.reason || 'このIPアドレスからのアクセスは禁止されています'), { status: 403, code: 'ip_banned', event: 'ip_banned_request' });
+  }
 }
 
-async function readProfile(db, user, admin, targetId) {
-  const visible = query => user.verified || admin
-    ? query
-    : query.or("is_limited.is.null,is_limited.eq.false");
-  const [profileResultRow, followerCount, followingCount, postResult, repostResult, followResult] = await Promise.all([
-    db.from("users").select(PROFILE_USER_COLUMNS).eq("id", targetId).maybeSingle(),
-    db.from("follows").select("following_id", { count: "exact", head: true }).eq("following_id", targetId),
-    db.from("follows").select("follower_id", { count: "exact", head: true }).eq("follower_id", targetId),
-    visible(db.from("posts").select(PROFILE_POST_COLUMNS, { count: "exact" }).eq("user_id", targetId)).order("created_at", { ascending: false }).limit(500),
-    db.from("reposts").select("post_id,created_at").eq("user_id", targetId).order("created_at", { ascending: false }).limit(500),
-    String(user.id) === targetId ? { data: [] } : db.from("follows").select("follower_id").eq("follower_id", user.id).eq("following_id", targetId).limit(1)
-  ]);
-  const profile = profileResult(profileResultRow);
-  if (!profile) return { ok: true, profile: null };
-  profileResult(followerCount);
-  profileResult(followingCount);
-  const posts = profileResult(postResult);
-  const reposts = profileResult(repostResult);
-  const following = profileResult(followResult).length > 0;
-  const postsById = new Map(posts.map(post => [String(post.id), post]));
-  const missingIds = [...new Set(reposts.map(row => row.post_id).filter(id => id && !postsById.has(String(id))))];
-  const repostPosts = await profileRows(missingIds, ids => visible(db.from("posts").select(PROFILE_POST_COLUMNS).in("id", ids)).order("id"));
-  for (const post of repostPosts) postsById.set(String(post.id), post);
-  const allPosts = [...postsById.values()];
-  const postIds = allPosts.map(post => post.id);
-  const authors = [...new Set(allPosts.map(post => post.user_id).filter(id => id && String(id) !== targetId))];
-  const [users, likes, replies, repostMeta, bookmarks, pollVotes] = await Promise.all([
-    profileRows(authors, ids => db.from("users").select(PROFILE_AUTHOR_COLUMNS).in("id", ids).order("id")),
-    profileRows(postIds, ids => db.from("likes").select("post_id,user_id").in("post_id", ids).order("post_id").order("user_id")),
-    profileRows(postIds, ids => db.from("replies").select("post_id").in("post_id", ids).order("post_id").order("id")),
-    profileRows(postIds, ids => db.from("reposts").select("post_id,user_id").in("post_id", ids).order("post_id").order("user_id")),
-    profileRows(postIds, ids => db.from("bookmarks").select("post_id,user_id").eq("user_id", user.id).in("post_id", ids).order("post_id")),
-    profileRows(allPosts.filter(post => post.poll).map(post => post.id), ids => db.from("poll_votes").select("post_id,user_id,option_index").in("post_id", ids).order("post_id").order("user_id").order("option_index"))
-  ]);
-  const repostPostIds = new Set(reposts.map(row => String(row.post_id)));
-  const replyCounts = new Map();
-  for (const { post_id } of replies) replyCounts.set(post_id, (replyCounts.get(post_id) || 0) + 1);
+function getPool() {
+  if (!process.env.TIDB_HOST || !process.env.TIDB_USER || !process.env.TIDB_PASSWORD || !process.env.TIDB_DATABASE) {
+    throw new Error('TiDB環境変数 TIDB_HOST / TIDB_USER / TIDB_PASSWORD / TIDB_DATABASE を設定してください');
+  }
+  if (!pool) {
+    pool = mysql.createPool({
+      host: process.env.TIDB_HOST,
+      port: Number(process.env.TIDB_PORT || 4000),
+      user: process.env.TIDB_USER,
+      password: process.env.TIDB_PASSWORD,
+      database: process.env.TIDB_DATABASE,
+      ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true },
+      waitForConnections: true,
+      // 接続を必要最小限にし、アイドル接続がメモリを占有し続けないようにする
+      connectionLimit: 3,
+      maxIdle: 1,
+      idleTimeout: 30000,
+      queueLimit: 20,
+      enableKeepAlive: true
+    });
+  }
+  return pool;
+}
+
+function getSupabase() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+  if (!supabase) {
+    supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+    });
+  }
+  return supabase;
+}
+
+function sendJson(res, status, data) {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(JSON.stringify(data));
+}
+
+function safeEqual(a, b) {
+  const aa = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+function readSession(req) {
+  const header = String(req.headers.authorization || '');
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token || !SESSION_SECRET) throw Object.assign(new Error('ログイン状態が切れました。再ログインしてください'), { status: 401 });
+  const parts = token.split('.');
+  if (parts.length !== 2) throw Object.assign(new Error('セッションが無効です'), { status: 401 });
+  const signature = crypto.createHmac('sha256', SESSION_SECRET).update(parts[0]).digest('base64url');
+  if (!safeEqual(signature, parts[1])) throw Object.assign(new Error('セッションが無効です'), { status: 401 });
+  let data;
+  try { data = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')); }
+  catch (_) { throw Object.assign(new Error('セッションが無効です'), { status: 401 }); }
+  if (data.iss !== 'chanpro-gather' || !data.sub || Number(data.exp) <= Math.floor(Date.now() / 1000)) {
+    throw Object.assign(new Error('セッションの有効期限が切れました。再ログインしてください'), { status: 401 });
+  }
+  return { id: String(data.sub), username: String(data.username || '') };
+}
+
+async function authenticate(req) {
+  const session = readSession(req);
+  const sb = getSupabase();
+  // users は従来どおり Supabase に置いたまま、削除・BAN状態を毎回確認する
+  if (sb) {
+    const { data, error } = await sb.from('users')
+      .select('id,username,role,ban_until')
+      .eq('id', session.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) throw Object.assign(new Error('ユーザーが見つかりません。再ログインしてください'), { status: 401 });
+    if (data.ban_until && new Date(data.ban_until).getTime() > Date.now()) {
+      throw Object.assign(new Error('このアカウントはBANされています'), { status: 403 });
+    }
+    return { ...session, username: data.username || session.username, role: data.role || 'user' };
+  }
+  return session;
+}
+
+async function rateLimit(db, ip, kind) {
+  const [limit, seconds] = {
+    image: [4, 1800], upload: [12, 600], speech: [30, 300], chat: [30, 300]
+  }[kind];
+  const normalized = normalizeIp(ip);
+  const canonical = isIP(normalized) === 6 ? new URL('http://[' + normalized + ']').hostname : normalized;
+  const key = crypto.createHmac('sha256', IP_HASH_SECRET || SESSION_SECRET).update(canonical).digest('hex');
+  await db.execute(
+    'INSERT IGNORE INTO ai_ip_limits (ip_key, action, window_start, request_count) VALUES (?, ?, UNIX_TIMESTAMP(), 0)',
+    [key, kind]
+  );
+  const [result] = await db.execute(
+    `UPDATE ai_ip_limits
+        SET request_count = IF(window_start <= UNIX_TIMESTAMP() - ?, 1, request_count + 1),
+            window_start = IF(window_start <= UNIX_TIMESTAMP() - ?, UNIX_TIMESTAMP(), window_start)
+      WHERE ip_key = ? AND action = ?
+        AND (window_start <= UNIX_TIMESTAMP() - ? OR request_count < ?)`,
+    [seconds, seconds, key, kind, seconds, limit]
+  );
+  if (result.affectedRows !== 1) {
+    throw Object.assign(new Error('\u5229\u7528\u56de\u6570\u306e\u4e0a\u9650\u306b\u9054\u3057\u307e\u3057\u305f\u3002\u6642\u9593\u3092\u304a\u3044\u3066\u304a\u8a66\u3057\u304f\u3060\u3055\u3044\u3002'), { status: 429, code: 'rate_limited' });
+  }
+}
+
+function cleanText(value, max, label) {
+  const text = String(value == null ? '' : value).trim();
+  if (!text) throw Object.assign(new Error(`${label}を入力してください`), { status: 400 });
+  if (text.length > max) throw Object.assign(new Error(`${label}は${max.toLocaleString('ja-JP')}文字以内にしてください`), { status: 400 });
+  return text;
+}
+
+async function getOwnedConversation(db, conversationId, userId) {
+  const id = String(conversationId || '');
+  if (!/^\d{1,18}$/.test(id)) throw Object.assign(new Error('会話IDが不正です'), { status: 400 });
+  const [rows] = await db.execute(
+    'SELECT id, title FROM ai_conversations WHERE id = ? AND user_id = ? LIMIT 1',
+    [id, userId]
+  );
+  if (!rows.length) throw Object.assign(new Error('会話が見つかりません'), { status: 404 });
+  return rows[0];
+}
+
+async function createConversation(db, user, title) {
+  const name = String(title || '新しいチャット').replace(/\s+/g, ' ').slice(0, 80) || '新しいチャット';
+  const [result] = await db.execute(
+    'INSERT INTO ai_conversations (user_id, title, created_at, updated_at) VALUES (?, ?, NOW(), NOW())',
+    [user.id, name]
+  );
+  return { id: String(result.insertId), title: name };
+}
+
+async function saveMessage(db, { conversationId, userId, role, messageType = 'text', content = '', imageUrl = null }) {
+  const connection = await db.getConnection();
+  try {
+    await connection.query('BEGIN PESSIMISTIC');
+    const [conversation] = await connection.execute(
+      'SELECT id FROM ai_conversations WHERE id = ? AND user_id = ? FOR UPDATE', [conversationId, userId]
+    );
+    if (!conversation.length) throw Object.assign(new Error('\u4f1a\u8a71\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093'), { status: 404 });
+    const [result] = await connection.execute(
+      'INSERT INTO ai_messages (conversation_id,user_id,role,message_type,content,image_url,created_at) VALUES (?,?,?,?,?,?,NOW())',
+      [conversationId, userId, role, messageType, content, imageUrl]
+    );
+    const [rows] = await connection.execute(
+      'SELECT id, role, message_type, content, image_url, created_at FROM ai_messages WHERE id = ?', [result.insertId]
+    );
+    await connection.commit();
+    return rows[0];
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function updateConversationTime(db, conversationId, userId) {
+  await db.execute('UPDATE ai_conversations SET updated_at = NOW() WHERE id = ? AND user_id = ?', [conversationId, userId]);
+}
+
+async function handleList(db, user) {
+  const [rows] = await db.execute(
+    `SELECT id, title, created_at, updated_at
+       FROM ai_conversations WHERE user_id = ?
+      ORDER BY updated_at DESC, id DESC LIMIT 40`,
+    [user.id]
+  );
+  return { ok: true, conversations: rows.map(row => ({ ...row, id: String(row.id) })) };
+}
+
+async function handleHistory(db, user, body) {
+  const conversation = await getOwnedConversation(db, body.conversationId, user.id);
+  const [rows] = await db.execute(
+    `SELECT id, role, message_type, content, image_url, created_at
+       FROM (
+         SELECT id, role, message_type, content, image_url, created_at
+           FROM ai_messages WHERE conversation_id = ? AND user_id = ?
+          ORDER BY id DESC LIMIT 60
+       ) recent ORDER BY id ASC`,
+    [conversation.id, user.id]
+  );
+  return { ok: true, conversation: { ...conversation, id: String(conversation.id) }, messages: rows.map(row => ({ ...row, id: String(row.id) })) };
+}
+
+async function callOpenAIChat(messages, user, customSystemPrompt, signal, voiceMode) {
+  if (!OPENAI_API_KEY) throw Object.assign(new Error('Vercel環境変数 OPENAI_API_KEY が設定されていません'), { status: 503 });
+  const formatted = messages.map(row => {
+    if (row.image_url) {
+      return { role: row.role, content: [
+        { type: 'text', text: String(row.content || 'この画像を確認してください').slice(0, 12000) },
+        { type: 'image_url', image_url: { url: row.image_url, detail: 'auto' } }
+      ] };
+    }
+    return { role: row.role, content: String(row.content || '').slice(0, 12000) };
+  });
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: OPENAI_CHAT_MODEL,
+      messages: [
+        { role: 'system', content: (String(customSystemPrompt || '').trim() || 'あなたはChanProのAIアシスタントです。日本語で、わかりやすく、正確に回答してください。必要なら箇条書きで整理し、分からないことは分からないと伝えてください。ユーザーが画像を送った場合は、その画像の内容を確認して回答してください。').slice(0, 6000) },
+        ...(voiceMode ? [{
+          role: 'system',
+          content: 'For the voice interface, start with exactly one label on its own line: [normal], [happy], [sad], [angry], [surprised], [sleepy] or [wink]. Pick the expression that best fits your reply, then write the actual answer on the next line. Use natural spoken language and keep the answer brief when the request allows it.'
+        }] : []),
+        ...formatted
+      ],
+      max_completion_tokens: 2500,
+      store: false,
+      user: crypto.createHash('sha256').update(String(user.id)).digest('hex').slice(0, 64)
+    }),
+    signal
+  });
+  const data = await response.json().catch(error => {
+    if (signal?.aborted || error.name === 'AbortError' || error.name === 'TimeoutError') throw error;
+    return {};
+  });
+  if (!response.ok) {
+    const message = data?.error?.message || `OpenAI APIエラー (${response.status})`;
+    throw Object.assign(new Error(message), { status: response.status === 429 ? 429 : 502, code: data?.error?.code || `openai_${response.status}` });
+  }
+  const content = data?.choices?.[0]?.message?.content;
+  const answer = typeof content === 'string' ? content.trim() : '';
+  if (!answer) throw Object.assign(new Error('AIから回答を取得できませんでした'), { status: 502 });
+  if (!voiceMode) return { answer, expression: 'normal' };
+  const marker = answer.match(/^\[([a-z]+)\][ \t]*\r?\n/i);
+  const expression = marker?.[1].toLowerCase();
+  const text = marker && EXPRESSIONS.has(expression) ? answer.slice(marker[0].length).trim() : answer;
+  return { answer: text || answer, expression: EXPRESSIONS.has(expression) ? expression : 'normal' };
+}
+
+function validateImgBBUrl(value) {
+  const raw = String(value || '').trim();
+  let url;
+  try { url = new URL(raw); } catch (_) { throw Object.assign(new Error('画像URLが不正です'), { status: 400 }); }
+  if (url.protocol !== 'https:' || !/(^|\.)ibb\.co$|(^|\.)imgbb\.com$/i.test(url.hostname)) {
+    throw Object.assign(new Error('ImgBBに保存された画像だけ利用できます'), { status: 400 });
+  }
+  return url.toString();
+}
+
+async function handleGetSettings(db, user) {
+  const [rows] = await db.execute('SELECT system_prompt FROM ai_user_settings WHERE user_id = ? LIMIT 1', [user.id]);
+  return { ok: true, systemPrompt: rows[0]?.system_prompt || '' };
+}
+
+async function handleSaveSettings(db, user, body) {
+  const prompt = String(body.systemPrompt || '').trim();
+  if (prompt.length > 6000) throw Object.assign(new Error('プロンプトは6,000文字以内にしてください'), { status: 400 });
+  await db.execute(
+    `INSERT INTO ai_user_settings (user_id, system_prompt, updated_at) VALUES (?, ?, NOW())
+     ON DUPLICATE KEY UPDATE system_prompt = VALUES(system_prompt), updated_at = NOW()`,
+    [user.id, prompt]
+  );
+  return { ok: true, systemPrompt: prompt };
+}
+
+async function handleDeleteConversation(db, user, body) {
+  const id = String(body.conversationId || '');
+  if (!/^\d{1,18}$/.test(id)) throw Object.assign(new Error('Invalid conversation ID'), { status: 400 });
+  const connection = await db.getConnection();
+  try {
+    await connection.query('BEGIN PESSIMISTIC');
+    const [rows] = await connection.execute(
+      'SELECT id FROM ai_conversations WHERE id = ? AND user_id = ? FOR UPDATE', [id, user.id]
+    );
+    if (!rows.length) throw Object.assign(new Error('\u4f1a\u8a71\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093'), { status: 404 });
+    await connection.execute('DELETE FROM ai_messages WHERE conversation_id = ? AND user_id = ?', [id, user.id]);
+    await connection.execute('DELETE FROM ai_conversations WHERE id = ? AND user_id = ?', [id, user.id]);
+    await connection.commit();
+    return { ok: true, deleted: true, conversationId: id };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function handleChat(db, user, body, ctx) {
+  await rateLimit(db, ctx.ip, 'chat');
+  const message = String(body.message || '').trim();
+  const imageUrl = body.imageUrl ? validateImgBBUrl(body.imageUrl) : null;
+  if (!message && !imageUrl) throw Object.assign(new Error('メッセージまたは画像を入力してください'), { status: 400 });
+  if (message.length > 12000) throw Object.assign(new Error('メッセージは12,000文字以内にしてください'), { status: 400 });
+  ctx.extra = { message_length: message.length, has_image: !!imageUrl, new_conversation: !body.conversationId };
+  let conversation;
+  if (body.conversationId) {
+    conversation = await getOwnedConversation(db, body.conversationId, user.id);
+  } else {
+    conversation = await createConversation(db, user, (message || '画像について').slice(0, 80));
+  }
+  const conversationId = String(conversation.id);
+  const conversationSummary = { id: conversationId, title: conversation.title };
+  ctx.extra.conversation_id = conversationId;
+  const userMessage = await saveMessage(db, {
+    conversationId, userId: user.id, role: 'user',
+    messageType: imageUrl ? 'image' : 'text',
+    content: message || 'この画像について教えてください。', imageUrl
+  });
+  ctx.savedInput = { conversation: conversationSummary, message: { ...userMessage, id: String(userMessage.id) } };
+  // 直近12件だけをAIへ渡す。古い会話全体を毎回読み込まないことでDB負荷を抑える。
+  const [[history], [settingsRows]] = await Promise.all([db.execute(
+    `SELECT role, message_type, content, image_url FROM (
+       SELECT role, message_type, content, image_url, id FROM ai_messages
+        WHERE conversation_id = ? AND user_id = ?
+        ORDER BY id DESC LIMIT 12
+     ) recent ORDER BY id ASC`,
+    [conversationId, user.id]
+  ), db.execute('SELECT system_prompt FROM ai_user_settings WHERE user_id = ? LIMIT 1', [user.id])]);
+  if (imageUrl) ctx.images.push({ kind: 'upload', url: imageUrl, via: 'chat' });
+  const { answer, expression } = await callOpenAIChat(history, user, settingsRows[0]?.system_prompt || '', ctx.signal, body.voiceMode === true);
+  const saved = await saveMessage(db, { conversationId, userId: user.id, role: 'assistant', content: answer });
+  await updateConversationTime(db, conversationId, user.id);
+  ctx.extra.answer_length = answer.length;
   return {
-    ok: true, profile, posts, reposts, repostPosts: allPosts.filter(post => repostPostIds.has(String(post.id))),
-    users: [profile, ...users], meta: { likes, replyCounts: [...replyCounts], reposts: repostMeta, bookmarks, pollVotes },
-    followers: followerCount.count, followingCount: followingCount.count, postCount: postResult.count, following
+    ok: true, conversationId, conversation: conversationSummary, expression,
+    userMessage: ctx.savedInput.message,
+    message: { ...saved, id: String(saved.id) }
   };
 }
 
-async function proxyReadBatch(payload,ip,user,admin,db,ctx){
- if(!SUPABASE_SERVICE_ROLE_KEY)throw fail("Vercel環境変数 SUPABASE_SERVICE_ROLE_KEY が設定されていません",503);
- if(!user?.id)throw fail("読み込みにはログインが必要です",401);
- const input=Array.isArray(payload.requests)?payload.requests:[];
- if(!input.length||input.length>30)throw fail("読み込み件数は1〜30件にしてください",400);
- const requests=input.map(item=>validateReadRequest(item,user,admin));
- const readTask=Promise.all(requests.map(async r=>{
-  // 非認証ユーザーが限定投稿の返信を読めないよう、親投稿をサーバー側で確認。
-  if(r.table==="replies"&&!user.verified&&!admin){
-   const ids=extractPostIds(r.url.searchParams.get("post_id"));
-   const {data:parents,error:parentError}=await db.from("posts").select("id,is_limited").in("id",ids);
-   if(parentError)throw parentError;
-   const allowed=(parents||[]).filter(p=>!p.is_limited).map(p=>String(p.id));
-   if(!allowed.length)return {status:200,headers:{"content-type":"application/json"},body:"[]"};
-   r.url.searchParams.set("post_id",`in.(${allowed.join(",")})`);
-   r.path=r.url.pathname+r.url.search;
+async function handleSpeech(db, user, body, ctx) {
+  const conversation = await getOwnedConversation(db, body.conversationId, user.id);
+  const messageId = String(body.messageId || '');
+  if (!/^\d{1,18}$/.test(messageId)) throw Object.assign(new Error('Invalid message ID'), { status: 400 });
+  const [rows] = await db.execute(
+    "SELECT content FROM ai_messages WHERE id = ? AND conversation_id = ? AND user_id = ? AND role = 'assistant' AND message_type = 'text'",
+    [messageId, conversation.id, user.id]
+  );
+  if (!rows[0]?.content) throw Object.assign(new Error('\u56de\u7b54\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093'), { status: 404 });
+  if (!OPENAI_API_KEY) throw Object.assign(new Error('OPENAI_API_KEY is not configured'), { status: 503 });
+  await rateLimit(db, ctx.ip, 'speech');
+  const delivery = {
+    happy: 'Bright, delighted, and genuinely enthusiastic, with a smile in the voice.',
+    sad: 'Gentle, unhurried, and compassionate, with soft pauses.',
+    angry: 'Firm and emphatic, with controlled intensity and no shouting.',
+    surprised: 'Start with audible surprise, then settle into an engaged, animated delivery.',
+    sleepy: 'Soft and relaxed, with a slower pace.',
+    wink: 'Playful and lightly mischievous.',
+    normal: 'Warm, expressive, and conversational; vary emphasis and pacing naturally.'
+  };
+  const expression = EXPRESSIONS.has(body.expression) ? body.expression : 'normal';
+  const voice = VOICES.has(body.voice) ? body.voice : 'onyx';
+  const response = await fetch('https://api.openai.com/v1/audio/speech', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini-tts', voice, instructions: delivery[expression], input: Array.from(rows[0].content).slice(0, 1800).join(''), response_format: 'mp3'
+    }),
+    signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(40000)])
+  });
+  if (!response.ok) throw Object.assign(new Error('\u97f3\u58f0\u3092\u751f\u6210\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f'), {
+    status: response.status === 429 ? 429 : 502, code: `speech_${response.status}`
+  });
+  return { ok: true, audio: Buffer.from(await response.arrayBuffer()).toString('base64') };
+}
+
+async function uploadToImgBB(base64, signal, maxBytes = 3 * 1024 * 1024) {
+  if (!IMGBB_API_KEY) throw Object.assign(new Error('Vercel環境変数 IMGBB_API_KEY が設定されていません'), { status: 503 });
+  const clean = String(base64 || '').replace(/^data:image\/[a-z0-9.+-]+;base64,/i, '').replace(/\s/g, '');
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) throw Object.assign(new Error('画像データが不正です'), { status: 400 });
+  const bytes = Buffer.from(clean, 'base64');
+  if (!bytes.length || bytes.length > maxBytes) throw Object.assign(new Error(`画像は${Math.floor(maxBytes / 1024 / 1024)}MB以下にしてください`), { status: 413 });
+  const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  const isPng = bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
+  const isWebp = bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP';
+  if (!isJpeg && !isPng && !isWebp) throw Object.assign(new Error('JPEG・PNG・WebP画像のみ送信できます'), { status: 400 });
+  const form = new URLSearchParams();
+  form.set('image', clean);
+  form.set('name', `chanpro-ai-${Date.now()}`);
+  const response = await fetch(`https://api.imgbb.com/1/upload?key=${encodeURIComponent(IMGBB_API_KEY)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(45000)])
+  });
+  const data = await response.json().catch(error => {
+    if (signal?.aborted || error.name === 'AbortError' || error.name === 'TimeoutError') throw error;
+    return {};
+  });
+  if (!response.ok || !data?.success || !data?.data?.url) {
+    throw Object.assign(new Error(data?.error?.message || 'ImgBBへの画像保存に失敗しました'), { status: 502 });
   }
-  const upstream=await fetch(SUPABASE_URL+r.path,{method:r.method,headers:r.headers,signal:AbortSignal.timeout(12000)});
-  const body=r.method==="HEAD"||[204,304].includes(upstream.status)?"":await upstream.text(),headers={};
-  for(const key of ["content-type","content-range","preference-applied","content-profile","accept-profile","cache-control","etag","last-modified"])if(upstream.headers.get(key))headers[key]=upstream.headers.get(key);
-  return {status:upstream.status,headers,body};
- }));
- ctx.later.push(axiomLog("db_read_batch",ip,{user_id:String(user.id),username:user.username||null,request_count:requests.length,reads:requests.map(r=>({table:r.table,method:r.method,query_keys:[...new Set([...r.url.searchParams.keys()])]}))}));
- const results=await readTask;
- return {ok:true,results};
+  // display_urlではなく、画像データをそのまま取得できる元URLを保存する
+  return { url: String(data.data.url), deleteUrl: data.data.delete_url ? String(data.data.delete_url) : null, size: bytes.length };
 }
 
-function validateChatRoomName(value){const room=String(value||"room").trim();if(!room||room.length>80||/[\u0000-\u001f\u007f]/.test(room))throw fail("チャットルーム名が不正です",400);return room}
-async function uploadImageToImgBB(db,payload,user,ip){
- if(!IMGBB_API_KEY)throw fail("Vercel環境変数 IMGBB_API_KEY が設定されていません",503);
- const base64=String(payload.imageBase64||"").replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/i,"").replace(/\s/g,"");
- if(!/^[A-Za-z0-9+/]+={0,2}$/.test(base64))throw fail("画像データが不正です",400);
- const bytes=Buffer.from(base64,"base64");
- const kind=String(payload.kind||"post"),maxBytes=kind==="music"?3145728:1258291;if(!bytes.length||bytes.length>maxBytes)throw fail(kind==="music"?"音楽画像データは3MB以下にしてください":"圧縮後の画像は1.2MB以下にしてください",413);
- const filename=String(payload.filename||"chanpro-image.jpg").replace(/[^A-Za-z0-9._-]/g,"_").slice(0,100);
- const form=new URLSearchParams();form.set("image",base64);form.set("name",filename);
- const upstream=await fetch("https://api.imgbb.com/1/upload?key="+encodeURIComponent(IMGBB_API_KEY),{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:form.toString(),signal:AbortSignal.timeout(20000)});
- const result=await upstream.json().catch(()=>null);
- if(!upstream.ok||!result?.success||!result?.data?.url)throw fail(result?.error?.message||"ImgBBへの画像アップロードに失敗しました",502);
- // 音声を埋め込んだPNGは、縮小・最適化されたdisplay_urlではなく、
-  // ImgBBが返す元画像URLを必ず使う。display_url側では画素データが変わり、A2P1ヘッダーが壊れる場合がある。
-  const url=String(result.data.url),displayUrl=String(result.data.display_url||result.data.url),deleteUrl=result.data.delete_url?String(result.data.delete_url):null;
- if(kind==="chat"){
-  const {error}=await db.from("chat_image_assets").insert({user_id:user.id,image_url:url,delete_url:deleteUrl});
-  if(error)console.warn("chat_image_assets登録失敗:",error.message);
- }
- await axiomLog("image_upload",ip,{user_id:String(user.id),username:user.username||null,kind:String(payload.kind||"post"),size_bytes:bytes.length,provider:"imgbb",filename:filename});
- return {ok:true,url:url,displayUrl:displayUrl,deleteUrl:deleteUrl,sizeBytes:bytes.length};
+async function handleUpload(db, body, ctx) {
+  await rateLimit(db, ctx.ip, 'upload');
+  const up = await uploadToImgBB(body.imageBase64, ctx.signal);
+  ctx.images.push({ kind: 'upload', url: up.url, delete_url: up.deleteUrl, size_bytes: up.size, via: 'upload' });
+  return { ok: true, imageUrl: up.url };
 }
 
-
-async function trimNotifications(db,userId){try{const cutoff=new Date(Date.now()-2592e6).toISOString();const[{error:oldError},{data:data,error:readError}]=await Promise.all([db.from("notifications").delete().eq("user_id",userId).lt("created_at",cutoff),db.from("notifications").select("id").eq("user_id",userId).order("created_at",{ascending:!1}).range(100,599)]);if(oldError)console.warn("old notification trim failed:",oldError.message);if(readError)throw readError;if(data?.length){const{error}=await db.from("notifications").delete().in("id",data.map(r=>r.id));if(error)throw error}}catch(e){console.warn("notification trim failed:",e?.message||e)}}
-
-async function addNotifications(db,rows,{dedupe:dedupe=!1,allowSelf:allowSelf=!1}={}){try{if(!(rows=(rows||[]).filter(r=>r&&r.user_id&&(allowSelf||String(r.user_id)!==String(r.actor_id)))).length)return;if(dedupe){const checks=await Promise.all(rows.map(async r=>{let q=db.from("notifications").select("id").eq("user_id",r.user_id).eq("actor_id",r.actor_id).eq("type",r.type).limit(1);q=r.post_id?q.eq("post_id",r.post_id):q.is("post_id",null);const{data:data}=await q;return data?.length?null:r}));if(!(rows=checks.filter(Boolean)).length)return}const insertResults=await Promise.all(chunk(rows,500).map(part=>db.from("notifications").insert(part)));for(const result of insertResults)result.error&&console.warn("notification insert failed:",result.error.message)}catch(e){console.warn("addNotifications failed:",e?.message||e)}}
-
-function normalizePoll(poll){if(null==poll)return null;if("object"!=typeof poll||Array.isArray(poll))throw fail("アンケートの形式が不正です",400);const question=String(poll.question||"").trim().slice(0,200),options=(Array.isArray(poll.options)?poll.options:[]).map(o=>String(o||"").trim().slice(0,100)).filter(Boolean);if(!question)throw fail("アンケートの質問を入力してください",400);if(options.length<2||options.length>4)throw fail("選択肢は2〜4個にしてください",400);if(new Set(options).size!==options.length)throw fail("選択肢は重複させないでください",400);return{question:question,options:options}}
-
-// ---- トレンド(ハッシュタグ)集計 ----
-// 本文からタグを抽出(重複除去・小文字化・最大30個)。フロントの表示/検索側と正規化を揃えること
-function extractHashtags(content){const text=String(content||""),found=text.match(/[#＃][^\s#＃!-\/:-@\[-`{-~　、。，．！？「」『』（）]+/g)||[];return[...new Set(found.map(t=>t.slice(1).toLowerCase()).filter(t=>t.length>=1&&t.length<=50))].slice(0,30)}
-
-// delta=+1: 投稿作成時に加算 / delta=-1: 投稿削除時に減算(0以下になったタグは削除)
-async function countHashtags(db,content,delta=1){if(!SERVER_COUNT_HASHTAGS)return;try{const tags=extractHashtags(content);if(!tags.length)return;const{error:error}=await db.rpc("adjust_hashtags",{p_tags:tags,p_delta:delta});if(error)console.warn("hashtag update failed:",error.message)}catch(e){console.warn("countHashtags failed:",e?.message||e)}}
-
-let stickerCache={at:0,map:null};
-
-async function getStickerPrice(stampUrl){if(!stickerCache.map||Date.now()-stickerCache.at>3e5){const res=await fetch(STICKERS_URL,{signal:AbortSignal.timeout(4e3),cache:"no-store"});if(!res.ok)throw fail("スタンプ情報を取得できませんでした",503);const list=await res.json(),map=new Map;for(const s of Array.isArray(list)?list:[])s?.url&&map.set(String(s.url),Number(s.price||0));stickerCache={at:Date.now(),map:map}}return stickerCache.map.has(stampUrl)?stickerCache.map.get(stampUrl):null}
-
-async function updatePointsCas(db,userId,oldPoints,patch){const{data:data,error:error}=await db.from("users").update(patch).eq("id",userId).eq("points",Number(oldPoints||0)).select("id");if(error)throw error;if(!data?.length)throw fail("ポイントが同時に更新されました。もう一度お試しください",409)}
-
-function japanDateParts(date=new Date){const parts=new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(date),values=Object.fromEntries(parts.map(part=>[part.type,part.value]));return{year:Number(values.year),month:Number(values.month),day:Number(values.day)}}
-
-function isoWeekKeyFromYmd(year,month,day){const date=new Date(Date.UTC(year,month-1,day)),weekday=date.getUTCDay()||7;date.setUTCDate(date.getUTCDate()+4-weekday);const isoYear=date.getUTCFullYear(),yearStart=new Date(Date.UTC(isoYear,0,1)),week=Math.ceil(((date-yearStart)/864e5+1)/7);return`${isoYear}-W${String(week).padStart(2,"0")}`}
-
-function currentJapanWeek(){const{year:year,month:month,day:day}=japanDateParts(),localMidnightAsUtc=Date.UTC(year,month-1,day),weekday=new Date(localMidnightAsUtc).getUTCDay()||7,mondayYmd=new Date(localMidnightAsUtc-864e5*(weekday-1)),startUtc=new Date(mondayYmd.getTime()-324e5),endUtc=new Date(startUtc.getTime()+6048e5),previousYmd=new Date(mondayYmd.getTime()-6048e5);return{key:isoWeekKeyFromYmd(year,month,day),previousKey:isoWeekKeyFromYmd(previousYmd.getUTCFullYear(),previousYmd.getUTCMonth()+1,previousYmd.getUTCDate()),start:startUtc.toISOString(),end:endUtc.toISOString()}}
-
-function missingRpc(error) {
- return error.code === "PGRST202" || error.code === "42883";
+async function callOpenAIImage(prompt, user, signal) {
+  if (!OPENAI_API_KEY) throw Object.assign(new Error('Vercel環境変数 OPENAI_API_KEY が設定されていません'), { status: 503 });
+  const response = await fetch('https://api.openai.com/v1/images/generations', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: OPENAI_IMAGE_MODEL,
+      prompt,
+      n: 1,
+      size: '1024x1024',
+      quality: 'medium',
+      output_format: 'png',
+      safety_identifier: crypto.createHash('sha256').update(String(user.id)).digest('hex').slice(0, 64)
+    }),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(180000)])
+  });
+  const data = await response.json().catch(error => {
+    if (signal?.aborted || error.name === 'AbortError' || error.name === 'TimeoutError') throw error;
+    return {};
+  });
+  if (!response.ok) {
+    const message = data?.error?.message || `画像生成APIエラー (${response.status})`;
+    throw Object.assign(new Error(message), { status: response.status === 429 ? 429 : 502, code: data?.error?.code || `openai_image_${response.status}` });
+  }
+  const base64 = data?.data?.[0]?.b64_json;
+  if (typeof base64 !== 'string' || !base64) throw Object.assign(new Error('画像生成結果を取得できませんでした'), { status: 502 });
+  return uploadToImgBB(base64, signal, 8 * 1024 * 1024);
 }
 
-function unpackBonus(data) {
- const result = Array.isArray(data) ? data[0] : data;
- if (!result || typeof result !== "object") throw fail("\u30dc\u30fc\u30ca\u30b9\u306e\u51e6\u7406\u7d50\u679c\u3092\u53d6\u5f97\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f", 502);
- return result;
+async function handleImage(db, user, body, ctx) {
+  await rateLimit(db, ctx.ip, 'image');
+  const prompt = cleanText(body.prompt, 3000, '画像の説明');
+  ctx.extra = { prompt_length: prompt.length };
+  let conversation;
+  if (body.conversationId) {
+    conversation = await getOwnedConversation(db, body.conversationId, user.id);
+  } else {
+    conversation = await createConversation(db, user, `画像生成: ${prompt.slice(0, 65)}`);
+  }
+  const conversationId = String(conversation.id);
+  const conversationSummary = { id: conversationId, title: conversation.title };
+  ctx.extra.conversation_id = conversationId;
+  const userMessage = await saveMessage(db, { conversationId, userId: user.id, role: 'user', content: `画像生成: ${prompt}` });
+  ctx.savedInput = { conversation: conversationSummary, message: { ...userMessage, id: String(userMessage.id) } };
+  const generated = await callOpenAIImage(prompt, user, ctx.signal);
+  const imageUrl = generated.url;
+  ctx.images.push({ kind: 'generated', url: imageUrl, delete_url: generated.deleteUrl, size_bytes: generated.size, via: 'image', prompt: prompt.slice(0, 200) });
+  const saved = await saveMessage(db, {
+    conversationId, userId: user.id, role: 'assistant', messageType: 'image',
+    content: `画像を生成し、ImgBBに保存しました。\n内容: ${prompt}`,
+    imageUrl
+  });
+  await updateConversationTime(db, conversationId, user.id);
+  return { ok: true, conversationId, conversation: conversationSummary, userMessage: ctx.savedInput.message, message: { ...saved, id: String(saved.id) } };
 }
 
-async function awardLoginBonus(db, userId) {
- const { year, month, day } = japanDateParts();
- const midnight = Date.UTC(year, month - 1, day);
- const today = new Date(midnight).toISOString().slice(0, 10);
- const yesterday = new Date(midnight - 86400000).toISOString().slice(0, 10);
- for (let attempt = 0; attempt < 3; attempt++) {
-  const { data: row, error } = await db.from("users").select("points,login_streak,last_login_date").eq("id", userId).single();
-  if (error) throw error;
-  const points = Number(row.points || 0);
-  if (row.last_login_date === today) return { points, streak: row.login_streak || 0, bonus: 0, awarded: false };
-  const streak = row.last_login_date === yesterday ? Number(row.login_streak || 0) + 1 : 1;
-  const bonus = streak === 7 ? 15 : 5;
-  let query = db.from("users").update({ points: points + bonus, login_streak: streak, last_login_date: today }).eq("id", userId);
-  query = row.points == null ? query.is("points", null) : query.eq("points", row.points);
-  query = row.last_login_date == null ? query.is("last_login_date", null) : query.eq("last_login_date", row.last_login_date);
-  const { data: updated, error: updateError } = await query.select("id");
-  if (updateError) throw updateError;
-  if (updated.length) return { points: points + bonus, streak, bonus, awarded: true };
- }
- throw fail("\u30ed\u30b0\u30a4\u30f3\u30dc\u30fc\u30ca\u30b9\u3092\u66f4\u65b0\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u518d\u8a66\u884c\u3057\u3066\u304f\u3060\u3055\u3044", 409);
+/* ================= Axiom ログ(管理サイトの「AI利用」「画像」で表示) ================= */
+const AXIOM_TIMEOUT_MS = 2500;
+const blockedLogSeen = new Map();
+
+async function ingestAxiom(events) {
+  if (!AXIOM_TOKEN) { console.warn('AI Axiom logging skipped: AXIOM_TOKEN is not configured'); return; }
+  if (!events.length) return;
+  try {
+    const response = await fetch(`https://api.axiom.co/v1/datasets/${encodeURIComponent(AXIOM_DATASET)}/ingest`, {
+      method: 'POST', headers: { Authorization: `Bearer ${AXIOM_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(events), signal: AbortSignal.timeout(AXIOM_TIMEOUT_MS)
+    });
+    if (!response.ok) console.warn('AI Axiom log failed:', response.status);
+  } catch (logError) { console.warn('AI Axiom log failed:', logError?.message || logError); }
 }
 
-async function awardWeeklyPostBonus(db,userId){const week=currentJapanWeek(),{data:recentPost,error:postError}=await db.from("posts").select("id").eq("user_id",userId).gte("created_at",week.start).lt("created_at",week.end).limit(1).maybeSingle();if(postError)throw postError;if(!recentPost)return{awarded:!1,points:null,streak:null,week:week.key,bonus:0,reason:"no_post_this_week"};const{data:currentUser,error:userError}=await db.from("users").select("id,points,consecutive_post_weeks,last_post_week").eq("id",userId).maybeSingle();if(userError)throw userError;if(!currentUser)throw fail("ユーザーが見つかりません",401);const lastWeek=String(currentUser.last_post_week||""),currentPoints=Number(currentUser.points||0),currentStreak=Number(currentUser.consecutive_post_weeks||0);if(lastWeek===week.key)return{awarded:!1,points:currentPoints,streak:currentStreak,week:week.key,bonus:0,reason:"already_awarded"};const streak=lastWeek===week.previousKey?currentStreak+1:1,bonus=30*streak;let update=db.from("users").update({points:currentPoints+bonus,consecutive_post_weeks:streak,last_post_week:week.key}).eq("id",userId);update=currentUser.points==null?update.is("points",null):update.eq("points",currentPoints);update=currentUser.last_post_week==null?update.is("last_post_week",null):update.eq("last_post_week",currentUser.last_post_week);const{data:updated,error:updateError}=await update.select("id");if(updateError)throw updateError;if(!updated||0===updated.length){const{data:latest,error:latestError}=await db.from("users").select("points,consecutive_post_weeks,last_post_week").eq("id",userId).maybeSingle();if(latestError)throw latestError;if(latest&&String(latest.last_post_week||"")===week.key)return{awarded:!1,points:Number(latest.points||0),streak:Number(latest.consecutive_post_weeks||0),week:week.key,bonus:0,reason:"already_awarded"};throw fail("連続投稿ボーナスを更新できませんでした。再試行してください",409)}return await addNotifications(db,[{user_id:userId,actor_id:userId,type:"post_streak",message:`連続投稿${streak*7}日達成！${bonus}ポイント獲得`}],{allowSelf:!0}),{awarded:!0,points:currentPoints+bonus,streak:streak,week:week.key,bonus:bonus,reason:"awarded"}}
-
-async function handle(req,res,ctx){if(res.setHeader("Access-Control-Allow-Origin","*"),res.setHeader("Access-Control-Allow-Methods","POST, OPTIONS"),res.setHeader("Access-Control-Allow-Headers","Content-Type, Authorization, apikey, x-client-info"),res.setHeader("Access-Control-Max-Age","86400"),res.setHeader("Vary","Origin"),"OPTIONS"===req.method)return res.status(204).end();if("POST"!==req.method)return json(res,405,{error:"POST only"});try{const ip=getClientIp(req),ipHash=hashIp(ip),db=client(req),body="string"==typeof req.body?JSON.parse(req.body||"{}"):req.body||{},action=String(body.action||"");ctx.ip=ip,ctx.ipHash=ipHash,ctx.db=db,ctx.body=body,ctx.action=action,ipInfoCache.size>2e3&&ipInfoCache.clear(),ipInfoCache.set(ip,requestInfo(req));const hasBearer=String(req.headers.authorization||"").startsWith("Bearer ");if(!["check-ip","login","register"].includes(action)&&!hasBearer)throw fail("ログイン状態が切れました。再ログインしてください",401);const gate=await getGate(db);if(!gate.enabled)return ctx.blocked=!0,Date.now()-lastBlockedLog>3e4&&(lastBlockedLog=Date.now(),ctx.later.push(axiomLog("server_blocked",ip,{action:action,reason:"server_disabled"}))),res.setHeader("Retry-After","60"),json(res,503,{error:gate.message,maintenance:!0});const sessionAuthPromise=["check-ip","login","register"].includes(action)?null:authenticateSession(db,req);const ipBanTask=checkIpBan(db,ipHash,ip,action);const rateLimitTask=(async()=>{try{await enforceIpRateLimit(db,ipHash)}catch(limitError){if(limitError.ipBlocked){ctx.later.push(sendPostHogSecurityEvent("chanpro_ip_blocked",ip,{ip_hash:ipHash,action:action}),axiomLog("ip_rate_limited",ip,{ip_hash:ipHash,action:action}))}throw limitError}})();await Promise.all([ipBanTask,rateLimitTask,...(sessionAuthPromise?[sessionAuthPromise]:[])]);if("check-ip"===action)return json(res,200,{ok:!0,ipCheck:"passed"});if("login"===action||"register"===action){const{username:username,password:password}=credentials(body),deviceHash=String(body.deviceHash||"").trim();if("register"===action&&!/^[a-f0-9]{32,128}$/i.test(deviceHash))throw fail("端末情報を確認できません。通常のブラウザで再試行してください",400);const attemptLogTask=sendPostHogSecurityEvent("register"===action?"chanpro_registration_attempt":"chanpro_login_attempt",ip,{ip_hash:ipHash,action:action,username:username,device_hash:deviceHash||void 0});if("register"===action){try{if(username.length<2||password.length<8)throw failR("ユーザー名は2文字以上、パスワードは8文字以上にしてください",400,"invalid_input");ctx.later.push(attemptLogTask);const[registerEnabled]=await Promise.all([isEnabled(db,"register_enabled"),checkDeviceBan(db,deviceHash,ip,action),checkBannedAccountDevice(db,deviceHash)]);if(!registerEnabled)throw await axiomLog("register_blocked",ip,{ip_hash:ipHash,username:username}),failR(await settingMessage(db,"register_disabled_message","現在新規作成を停止しています"),503,"register_disabled");const{data:data,error:error}=await db.rpc("register_account_limited",{p_username:username,p_password_hash:sha256(password),p_device_hash:deviceHash,p_device_info:body.deviceInfo||{}});if(error){if(/DEVICE_ACCOUNT_LIMIT/.test(error.message||""))throw failR("この端末で作成できる新規アカウントは5個までです",429,"device_limit");if("23505"===error.code)throw failR("そのユーザー名は既に使用されています",409,"username_taken");throw error}const user=data&&"object"==typeof data?data:null;if(!user?.id)throw new Error("新規アカウント作成の応答が不正です");delete user.password_hash;const deviceTask=db.from("user_devices").upsert({user_id:user.id,device_hash:deviceHash,device_info:body.deviceInfo||{},last_login_at:(new Date).toISOString()},{onConflict:"user_id,device_hash"});const auditTasks=[sendPostHogSecurityEvent("chanpro_registration_created",ip,{ip_hash:ipHash,user_id:String(user.id),username:String(user.username||""),device_hash:deviceHash}),axiomLog("register_created",ip,{ip_hash:ipHash,user_id:String(user.id),username:String(user.username||"")})];ctx.later.push(...auditTasks);ctx.loginUserId=user.id;const deviceResult=await deviceTask;deviceResult.error&&console.warn("user_devices の記録に失敗:",deviceResult.error.message);return json(res,200,{ok:!0,user:user,token:signSession(user),isAdmin:!1})}catch(e){throw await axiomLog("register_failed",ip,{ip_hash:ipHash,username:username,device_hash:deviceHash?deviceHash.slice(0,16):void 0,status:e.status||500,reason:e.reason||"error",message:String(e.message||"").slice(0,200)}),e}}let user;try{const authResult=await authenticate(db,body);ctx.later.push(attemptLogTask);user=authResult.user}catch(e){throw await axiomLog("login_failed",ip,{ip_hash:ipHash,username:username,status:e.status||500,reason:e.reason||"error",message:String(e.message||"").slice(0,200)}),e}const isPrivileged=["admin","developer"].includes(user.role);let loginEnabled;try{[loginEnabled]=await Promise.all([isPrivileged?Promise.resolve(!0):isEnabled(db,"login_enabled"),isPrivileged?Promise.resolve():checkDeviceBan(db,deviceHash,ip,action)])}catch(e){throw await axiomLog("login_failed",ip,{ip_hash:ipHash,username:username,user_id:String(user.id),status:e.status||500,reason:e.reason||"error",message:String(e.message||"").slice(0,200)}),e}if(!loginEnabled)throw await axiomLog("login_blocked",ip,{ip_hash:ipHash,username:username,user_id:String(user.id),reason:"login_disabled"}),failR(await settingMessage(db,"login_disabled_message","現在ログインを停止しています"),503,"login_disabled");if(isPrivileged&&!await isEnabled(db,"admin_login_enabled"))throw await axiomLog("login_blocked",ip,{ip_hash:ipHash,username:username,user_id:String(user.id),reason:"admin_login_disabled"}),failR(await settingMessage(db,"admin_login_disabled_message","現在、管理者のログインを停止しています"),503,"admin_login_disabled");delete user.password_hash;const loginLogTasks=[sendPostHogSecurityEvent("chanpro_login_success",ip,{ip_hash:ipHash,user_id:String(user.id),username:String(user.username||""),device_hash:deviceHash||void 0}),axiomLog("login_success",ip,{ip_hash:ipHash,user_id:String(user.id),username:String(user.username||""),device_hash:deviceHash||void 0})];if(deviceHash){const deviceResult=await db.from("user_devices").upsert({user_id:user.id,device_hash:deviceHash,device_info:body.deviceInfo||{},last_login_at:(new Date).toISOString()},{onConflict:"user_id,device_hash"});if(deviceResult.error)console.warn("user_devices の記録に失敗:",deviceResult.error.message)}ctx.later.push(...loginLogTasks);ctx.loginUserId=user.id;return json(res,200,{ok:!0,user:user,token:signSession(user),isAdmin:["admin","developer"].includes(user.role)})}const authResult=sessionAuthPromise?await sessionAuthPromise:null,user=authResult?.user||null,admin=!!user&&["admin","developer"].includes(user.role),payload=body.payload||{},accessLogTask=Promise.resolve();ctx.user=user;const featureKey=FEATURE_OF_ACTION[action];if(featureKey&&!admin)await assertFeature(db,ctx,featureKey,user,ip);if("post-create"===action&&payload.poll&&!admin)await assertFeature(db,ctx,"poll",user,ip);switch(action){case"db-read-batch":{const result=await proxyReadBatch(payload,ip,user,admin,db,ctx);return json(res,200,result)}
-case"profile-read": return json(res, 200, await readProfile(db, user, admin, requireId(payload.targetUserId, "\u30e6\u30fc\u30b6\u30fcID\u304c\u4e0d\u6b63\u3067\u3059")));
-case"limited-post-list":{if(!user.verified&&!admin)return json(res,200,{ok:!0,posts:[],replyCounts:{}});const{data:data,error:error}=await db.from("posts").select("id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at").eq("is_limited",!0).order("created_at",{ascending:!1}).limit(50);if(error)throw error;const ids=(data||[]).map(post=>String(post.id)),replyCounts={};for(const id of ids)replyCounts[id]=0;if(ids.length)for(let offset=0;;offset+=1e3){const{data:rows,error:replyError}=await db.from("replies").select("post_id").in("post_id",ids).range(offset,offset+999);if(replyError)throw replyError;for(const row of rows||[]){const id=String(row.post_id);replyCounts[id]=(replyCounts[id]||0)+1}if(!rows||rows.length<1e3)break}return json(res,200,{ok:!0,posts:data||[],replyCounts:replyCounts})}
-case"post-read":{const postId=requireId(payload.postId,"投稿IDがありません"),{data:post,error:error}=await db.from("posts").select("id,user_id,content,image_url,image_mqtt,is_limited,is_pinned,quote_post_id,poll,views,created_at").eq("id",postId).maybeSingle();if(error)throw error;if(!post)throw fail("投稿が見つかりません",404);if(post.is_limited&&!user.verified&&!admin)throw fail("この限定投稿は認証済みユーザーのみ閲覧できます",403);return json(res,200,{ok:!0,post:post})}
-case"reply-list":{const postId=requireId(payload.postId,"投稿IDがありません"),{data:post,error:postError}=await db.from("posts").select("id,user_id,is_limited").eq("id",postId).maybeSingle();if(postError)throw postError;if(!post)throw fail("投稿が見つかりません",404);if(post.is_limited&&!user.verified&&!admin)throw fail("この限定投稿の返信は閲覧できません",403);const{data:data,error:error}=await db.from("replies").select("id,post_id,user_id,content,parent_reply_id,created_at").eq("post_id",postId).order("created_at",{ascending:!0}).limit(1e3);if(error)throw error;return json(res,200,{ok:!0,replies:data||[]})}
-case"reply-prefetch":{const ids=[...new Set((Array.isArray(payload.postIds)?payload.postIds:[]).slice(0,20).map(id=>requireId(id,"投稿IDが不正です")))];if(!ids.length)return json(res,200,{ok:!0,repliesByPost:{}});const{data:posts,error:postsError}=await db.from("posts").select("id,user_id,is_limited").in("id",ids);if(postsError)throw postsError;const allowed=(posts||[]).filter(post=>!post.is_limited||user.verified||admin||String(post.user_id)===String(user.id)).map(post=>post.id);if(!allowed.length)return json(res,200,{ok:!0,repliesByPost:{}});const{data:rows,error:error}=await db.from("replies").select("id,post_id,user_id,content,parent_reply_id,created_at").in("post_id",allowed).order("created_at",{ascending:!0}).limit(2e3);if(error)throw error;const repliesByPost={};for(const id of allowed)repliesByPost[String(id)]=[];for(const row of rows||[])repliesByPost[String(row.post_id)].push(row);return json(res,200,{ok:!0,repliesByPost:repliesByPost})}
-case"post-create":{const content=String(payload.content||""),imageUrl=null==payload.image_url?null:String(payload.image_url),quotePostId=null==payload.quote_post_id?null:requireId(payload.quote_post_id,"引用元の投稿IDが不正です"),poll=normalizePoll(payload.poll);if(!(content.trim()||imageUrl||quotePostId||poll))throw fail("投稿内容を入力してください",400);if(content.length>1e5)throw fail("投稿内容が長すぎます",400);const visibleContent=content.replace(/```html\s*[\s\S]*?```/gi,"");if((visibleContent.match(/\n/g)||[]).length>30)throw fail("投稿の改行は最大30回までです（HTMLプログラム内は対象外）",400);if(imageUrl&&imageUrl.length>1e4)throw fail("画像URLが長すぎます",400);const{data:data,error:error}=await db.rpc("chanpro_create_post_atomic",{p_user_id:user.id,p_content:content,p_image_url:imageUrl,p_is_limited:!!payload.is_limited&&!!user.verified,p_quote_post_id:quotePostId,p_poll:poll,p_verified:!!user.verified,p_admin:!!admin,p_tags:extractHashtags(content)});if(error)throw error;if(!data?.post)throw new Error("投稿作成の応答が不正です");return json(res,200,{ok:!0,post:data.post,notifiedFollowers:data.notifiedFollowers!==!1,postBonus:data.postBonus||{awarded:!1,bonus:0,reason:"not_processed"}})}
-case"reply-create":{const postId=requireId(payload.post_id,"返信先の投稿IDがありません"),content=String(payload.content||"").trim(),parentReplyId=null==payload.parent_reply_id?null:requireId(payload.parent_reply_id,"返信先が不正です");if(!content)throw fail("返信内容を入力してください",400);if(content.length>2e4)throw fail("返信内容が長すぎます",400);const[postResult,parentResult]=await Promise.all([db.from("posts").select("id,user_id,is_limited").eq("id",postId).maybeSingle(),parentReplyId?db.from("replies").select("id,post_id,user_id").eq("id",parentReplyId).maybeSingle():Promise.resolve({data:null,error:null})]),{data:post,error:postError}=postResult;if(postError)throw postError;if(!post)throw fail("返信先の投稿が見つかりません",404);if(post.is_limited&&post.user_id!==user.id&&!admin&&!user.verified)throw fail("この限定投稿には認証済みユーザーのみ返信できます",403);let parentAuthor=null;if(parentReplyId){const{data:parent,error:parentError}=parentResult;if(parentError)throw parentError;if(!parent||String(parent.post_id)!==postId)throw fail("返信先が見つかりません",400);parentAuthor=parent.user_id}const row={post_id:postId,user_id:user.id,content:content,parent_reply_id:parentReplyId},{data:data,error:error}=await db.from("replies").insert(row).select("id,post_id,user_id,content,parent_reply_id,created_at").single();if(error)throw error;const targets=[...new Set([parentAuthor||post.user_id])],[_,refreshResult]=await Promise.all([addNotifications(db,targets.map(uid=>({user_id:uid,actor_id:user.id,type:"reply",post_id:postId}))),db.from("replies").select("id,post_id,user_id,content,parent_reply_id,created_at").eq("post_id",postId).order("created_at",{ascending:!0}).limit(1e3)]),{data:updatedReplies,error:replyRefreshError}=refreshResult;if(replyRefreshError)throw replyRefreshError;return json(res,200,{ok:!0,reply:data,replies:updatedReplies||[]})}
-case"reply-delete":{
- const replyId = requireId(payload.replyId, "\u8fd4\u4fe1ID\u304c\u3042\u308a\u307e\u305b\u3093");
- const { data: reply, error: readError } = await db.from("replies").select("id,user_id,post_id").eq("id", replyId).maybeSingle();
- if (readError) throw readError;
- if (!reply) throw fail("\u8fd4\u4fe1\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093", 404);
- if (!admin && String(reply.user_id) !== String(user.id)) throw fail("\u524a\u9664\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093", 403);
- const query = db.from("replies").delete().eq("id", replyId);
- const { error } = await (admin ? query : query.eq("user_id", user.id));
- if (error) throw error;
- return json(res, 200, { ok: true, postId: reply.post_id });
+// レスポンスを返した後に実行する(ユーザーを待たせない)
+async function writeAiLogs({ ctx, status, startedAt, error, req }) {
+  const headers = req?.headers || {};
+  const latency = Math.max(0, Date.now() - Number(startedAt || Date.now()));
+  const now = new Date().toISOString();
+  const place = {
+    country: headers['x-vercel-ip-country'] || null, region: headers['x-vercel-ip-country-region'] || null,
+    city: (() => { try { return headers['x-vercel-ip-city'] ? decodeURIComponent(headers['x-vercel-ip-city']) : null; } catch (_) { return null; } })()
+  };
+  const who = { user_id: ctx.user?.id ? String(ctx.user.id).slice(0, 64) : null, username: ctx.user?.username || null };
+  const events = [{
+    _time: now, source: 'chanpro-ai-api', type: 'ai_api',
+    action: String(ctx.action || 'unknown').slice(0, 40), ...who, ip: ctx.ip || null,
+    request_id: headers['x-vercel-id'] || null,
+    http_status: Number(status) || 500, latency_ms: latency, ms: latency,
+    error_code: error?.code ? String(error.code).slice(0, 80) : null,
+    error_message: error ? String(error.message || 'AI API error').slice(0, 500) : null,
+    method: req?.method || null, user_agent: String(headers['user-agent'] || '').slice(0, 200) || null,
+    ...place, ...(ctx.extra || {})
+  }];
+  if (error?.event === 'ip_banned_request') events.push({ _time: now, source: 'chanpro-ai-api', type: 'ip_banned_request', ip: ctx.ip, action: `ai:${ctx.action}`, reason: String(error.message).slice(0, 200), ...place });
+  if (error?.feature) {
+    const seenKey = `${ctx.user?.id || ctx.ip}|${error.feature}`;
+    if ((blockedLogSeen.get(seenKey) || 0) < Date.now() - 60000) {
+      blockedLogSeen.set(seenKey, Date.now()); if (blockedLogSeen.size > 3000) blockedLogSeen.clear();
+      events.push({ _time: now, source: 'chanpro-ai-api', type: 'feature_blocked', feature: error.feature, feature_label: AI_FEATURES[error.feature]?.label || error.feature, action: `ai:${ctx.action}`, ip: ctx.ip, ...who, ...place });
+    }
+  }
+  if (error?.maintenance) {
+    const seenKey = 'server';
+    if ((blockedLogSeen.get(seenKey) || 0) < Date.now() - 30000) { blockedLogSeen.set(seenKey, Date.now()); events.push({ _time: now, source: 'chanpro-ai-api', type: 'server_blocked', action: `ai:${ctx.action}`, reason: 'server_disabled', ip: ctx.ip, ...place }); }
+  }
+  for (const image of ctx.images || []) {
+    events.push({ _time: now, source: 'chanpro-ai-api', type: 'ai_image_upload', ...who, ip: ctx.ip, kind: image.kind, via: image.via, url: image.url, delete_url: image.delete_url || undefined, size_bytes: image.size_bytes || undefined, prompt: image.prompt || undefined });
+  }
+  await ingestAxiom(events);
 }
-case"post-delete":{const postId=requireId(payload.postId,"投稿IDがありません"),{data:post,error:readError}=await db.from("posts").select("id,user_id,content").eq("id",postId).maybeSingle();if(readError)throw readError;if(!post)throw fail("投稿が見つかりません",404);if(post.user_id!==user.id&&!admin)throw fail("削除権限がありません",403);const{error:error}=await db.from("posts").delete().eq("id",post.id);if(error)throw error;await countHashtags(db,post.content,-1);return json(res,200,{ok:!0})}
-case"post-view":{const postId=requireId(payload.postId,"投稿IDがありません"),{data:data,error:error}=await db.rpc("chanpro_increment_post_view",{p_post_id:postId,p_user_id:user.id});if(error)throw error;if(!data)throw fail("投稿が見つかりません",404);return json(res,200,{ok:!0,views:Number(data.views||0)})}
-case"post-pin":{const postId=requireId(payload.postId,"投稿IDがありません"),{data:post,error:error}=await db.from("posts").select("id,user_id").eq("id",postId).maybeSingle();if(error)throw error;if(!post)throw fail("投稿が見つかりません",404);if(post.user_id!==user.id&&!admin)throw fail("権限がありません",403);if(payload.pinned){const{error:clearError}=await db.from("posts").update({is_pinned:!1}).eq("user_id",post.user_id).eq("is_pinned",!0);if(clearError)throw clearError}const{error:updateError}=await db.from("posts").update({is_pinned:!!payload.pinned}).eq("id",post.id);if(updateError)throw updateError;return json(res,200,{ok:!0,pinned:!!payload.pinned})}
-case"post-like-toggle":{const post=await loadAccessiblePost(db,payload.postId,user,admin,"この限定投稿にはいいねできません"),{data:existing,error:findError}=await db.from("likes").select("id").eq("post_id",post.id).eq("user_id",user.id).maybeSingle();if(findError)throw findError;let liked;if(existing){const{error:error}=await db.from("likes").delete().eq("id",existing.id).eq("user_id",user.id);if(error)throw error;liked=!1}else{const{error:error}=await db.from("likes").insert({post_id:post.id,user_id:user.id});if(error&&"23505"!==error.code)throw error;liked=!0}const[countResult]=await Promise.all([db.from("likes").select("id",{count:"exact",head:!0}).eq("post_id",post.id),liked?addNotifications(db,[{user_id:post.user_id,actor_id:user.id,type:"like",post_id:post.id}],{dedupe:!0}):Promise.resolve()]),{count:count,error:countError}=countResult;if(countError)throw countError;return json(res,200,{ok:!0,liked:liked,count:Number(count||0)})}
-case"repost-toggle":{const post=await loadAccessiblePost(db,payload.postId,user,admin,"この限定投稿はリポストできません"),{data:existing,error:findError}=await db.from("reposts").select("id").eq("post_id",post.id).eq("user_id",user.id).maybeSingle();if(findError)throw findError;let reposted;if(existing){const{error:error}=await db.from("reposts").delete().eq("id",existing.id).eq("user_id",user.id);if(error)throw error;reposted=!1}else{const{error:error}=await db.from("reposts").insert({post_id:post.id,user_id:user.id});if(error&&"23505"!==error.code)throw error;reposted=!0}const[countResult]=await Promise.all([db.from("reposts").select("id",{count:"exact",head:!0}).eq("post_id",post.id),reposted?addNotifications(db,[{user_id:post.user_id,actor_id:user.id,type:"repost",post_id:post.id}],{dedupe:!0}):Promise.resolve()]),{count:count,error:countError}=countResult;if(countError)throw countError;return json(res,200,{ok:!0,reposted:reposted,count:Number(count||0)})}
-case"bookmark-toggle":{const post=await loadAccessiblePost(db,payload.postId,user,admin,"この限定投稿はブックマークできません"),{data:existing,error:findError}=await db.from("bookmarks").select("id").eq("post_id",post.id).eq("user_id",user.id).maybeSingle();if(findError)throw findError;let bookmarked;if(existing){const{error:error}=await db.from("bookmarks").delete().eq("id",existing.id).eq("user_id",user.id);if(error)throw error;bookmarked=!1}else{const{error:error}=await db.from("bookmarks").insert({post_id:post.id,user_id:user.id});if(error&&"23505"!==error.code)throw error;bookmarked=!0}return json(res,200,{ok:!0,bookmarked:bookmarked})}
-case"poll-vote":{const postId=requireId(payload.postId,"投稿IDがありません"),optionIndex=Number(payload.optionIndex);if(!Number.isInteger(optionIndex)||optionIndex<0||optionIndex>3)throw fail("選択肢が不正です",400);const{data:data,error:error}=await db.rpc("chanpro_poll_vote_atomic",{p_post_id:postId,p_user_id:user.id,p_username:String(user.username||"ユーザー"),p_option_index:optionIndex,p_verified:!!user.verified,p_admin:!!admin});if(error){if(error.code==="23505")throw fail("すでに投票しています",409);if((error.message||"").includes("POST_NOT_FOUND"))throw fail("投稿が見つかりません",404);if((error.message||"").includes("LIMITED_POST_FORBIDDEN"))throw fail("この限定投稿のアンケートには投票できません",403);if((error.message||"").includes("POLL_INVALID"))throw fail("この投稿にはアンケートがありません",400);throw error}return json(res,200,{ok:!0,optionIndex:optionIndex})}
-case"follow-toggle":{const targetId=requireId(payload.targetUserId,"対象ユーザーが不正です");if(targetId===String(user.id))throw fail("自分はフォローできません",400);const{data:data,error:error}=await db.rpc("chanpro_follow_toggle_atomic",{p_actor_id:user.id,p_target_id:targetId});if(error){if((error.message||"").includes("TARGET_NOT_FOUND"))throw fail("ユーザーが見つかりません",404);throw error}return json(res,200,{ok:!0,following:!!data.following})}
-case"notifications-cleanup":{await trimNotifications(db,user.id);return json(res,200,{ok:!0})}
-case"notifications-read":{const{error:error}=await db.from("notifications").update({is_read:!0}).eq("user_id",user.id).eq("is_read",!1);if(error)throw error;return await trimNotifications(db,user.id),json(res,200,{ok:!0})}
-case"report-create":{const targetId=requireId(payload.targetUserId,"通報対象が不正です"),postId=null==payload.postId||""===payload.postId?null:requireId(payload.postId,"投稿IDが不正です"),reason=String(payload.reason||"").trim();if(!reason)throw fail("通報理由を入力してください",400);if(reason.length>2e3)throw fail("通報理由が長すぎます",400);if(targetId===String(user.id))throw fail("自分自身は通報できません",400);const since=new Date(Date.now()-3e5).toISOString();let dup=db.from("reports").select("id").eq("reporter_id",user.id).eq("target_user_id",targetId).gte("created_at",since).limit(1);dup=postId?dup.eq("post_id",postId):dup.is("post_id",null);const{data:recent}=await dup;if(recent?.length)throw fail("同じ内容を短時間に繰り返し通報することはできません",429);const{error:error}=await db.from("reports").insert({reporter_id:user.id,target_user_id:targetId,post_id:postId,reason:reason});if(error)throw error;ctx.later.push(axiomLog("report_created",ip,{user_id:String(user.id),target_user_id:targetId,post_id:postId||null}));return json(res,200,{ok:!0,message:"通報しました"})}
-case"report-resolve":{if(!admin)throw fail("管理者権限が必要です",403);const reportId=requireId(payload.reportId,"通報IDが不正です"),{error:error}=await db.from("reports").update({status:"resolved"}).eq("id",reportId);if(error)throw error;return json(res,200,{ok:!0})}
-case"report":{const message=String(payload.message||"").trim();if(!message||message.length>5e3)throw fail("報告内容を入力してください",400);const{error:error}=await db.from("gather_reports").insert({user_id:user.id,username:user.username,content:message});if(error)throw error;ctx.later.push(axiomLog("gather_report_submitted",ip,{user_id:String(user.id),username:user.username||null,content_length:message.length}));return json(res,200,{ok:!0,message:"報告を送信しました"})}
-case"dm-list":{let q=db.from("messages").select("id,sender_id,receiver_id,content,created_at");if(payload.withUserId){const other=requireId(payload.withUserId,"相手のIDが不正です");q=q.or(`and(sender_id.eq.${user.id},receiver_id.eq.${other}),and(sender_id.eq.${other},receiver_id.eq.${user.id})`);if(Object.prototype.hasOwnProperty.call(payload,"limit")){const limit=Math.max(1,Math.min(50,Math.trunc(Number(payload.limit)||50))),cursor=payload.before&&typeof payload.before==="object"?payload.before:null;q=q.order("created_at",{ascending:!1}).order("id",{ascending:!1});if(cursor?.created_at&&cursor?.id){const stamp=new Date(cursor.created_at);if(Number.isNaN(stamp.getTime()))throw fail("DM履歴カーソルが不正です",400);const cursorId=requireId(cursor.id,"DM履歴カーソルが不正です");q=q.or(`created_at.lt.${stamp.toISOString()},and(created_at.eq.${stamp.toISOString()},id.lt.${cursorId})`)}const{data:data,error:error}=await q.limit(limit+1);if(error)throw error;const page=(data||[]).slice(0,limit),hasMore=(data||[]).length>limit,oldest=page.length?page[page.length-1]:null;page.reverse();return json(res,200,{ok:!0,messages:page,hasMore,nextCursor:oldest?{created_at:oldest.created_at,id:oldest.id}:null})}q=q.order("created_at",{ascending:!0});const{data:data,error:error}=await q.limit(1e3);if(error)throw error;return json(res,200,{ok:!0,messages:data||[]})}q=q.or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`).order("created_at",{ascending:!1});const{data:data,error:error}=await q.limit(1e3);if(error)throw error;return json(res,200,{ok:!0,messages:data||[]})}
-case"dm-get":{const messageId=requireId(payload.messageId,"DMメッセージIDが不正です");const{data:message,error}=await db.from("messages").select("id,sender_id,receiver_id,content,created_at").eq("id",messageId).or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`).maybeSingle();if(error)throw error;if(!message)throw fail("DMが見つかりません",404);return json(res,200,{ok:!0,message})}
-case"dm-send":{const recipientId=requireId(payload.recipientId,"宛先が不正です"),content=String(payload.content||"").trim();if(!content||content.length>1e4)throw fail("DMの内容を確認してください",400);if(recipientId===String(user.id))throw fail("自分にはDMを送れません",400);const{data:data,error:error}=await db.rpc("chanpro_dm_send_atomic",{p_sender_id:user.id,p_recipient_id:recipientId,p_content:content});if(error){if((error.message||"").includes("RECIPIENT_NOT_FOUND"))throw fail("送信先が見つかりません",404);throw error}return json(res,200,{ok:!0,message:data.message,notified:!!data.notified})}
-case"user-update":{const patch={};for(const key of ownUserFields)Object.prototype.hasOwnProperty.call(payload,key)&&(patch[key]=payload[key]);if(Object.prototype.hasOwnProperty.call(payload,"settings")){const settings={};for(const key of settingFields)Object.prototype.hasOwnProperty.call(payload.settings||{},key)&&(settings[key]=payload.settings[key]);patch.settings={...user.settings||{},...settings}}if(Object.prototype.hasOwnProperty.call(payload,"newUsername")){const name=String(payload.newUsername||"").trim();if(name.length<2||name.length>100)throw fail("ユーザー名は2〜100文字にしてください",400);patch.username=name}if(Object.prototype.hasOwnProperty.call(payload,"newPassword")){const password=String(payload.newPassword||"");if(password.length<8)throw fail("パスワードは8文字以上にしてください",400);patch.password_hash=sha256(password)}if(!Object.keys(patch).length)throw fail("変更内容がありません",400);const{data:data,error:error}=await db.from("users").update(patch).eq("id",user.id).select("id,username,icon_url,cover_url,profile,role,verified,settings,program_urls,program_views,program_likes,profile_music,points,stamp_list,login_streak,last_login_date").single();if(error){if("23505"===error.code)throw fail("そのユーザー名は既に使用されています",409);throw error}return json(res,200,{ok:!0,user:data,message:"アカウント情報を更新しました"})}
-case"profile-music-save":{
- const music=payload.music;
- if(!music||typeof music!=="object"||Array.isArray(music))throw fail("音楽情報がありません",400);
- const musicId=String(music.music_id||"");
- const name=String(music.name||"").trim();
- const mime=String(music.mime||"application/octet-stream").slice(0,120);
- const size=Number(music.size);
- const storage=String(music.storage||"");
- let url;
- try{url=new URL(String(music.url||""))}catch(_){throw fail("音楽ファイルURLが不正です",400)}
- if(!/^[A-Za-z0-9_-]{8,100}$/.test(musicId)||!name||name.length>240)throw fail("音楽情報が不正です",400);
- if(!Number.isInteger(size)||size<1||size>4194304)throw fail("音楽ファイルのサイズが不正です（最大4MB）",400);
- if(storage!=="imgbb-audio-png"||url.protocol!=="https:"||!(url.hostname==="ibb.co"||url.hostname.endsWith(".ibb.co")||url.hostname==="imgbb.com"||url.hostname.endsWith(".imgbb.com")))throw fail("音楽ファイルの保存先が不正です",400);
- const saved={music_id:musicId,name:name,mime:mime,size:size,storage:storage,url:url.toString(),created_at:new Date().toISOString()};
- const{data,error}=await db.from("users").update({profile_music:saved}).eq("id",user.id).select("id,username,profile_music").single();
- if(error)throw error;
- ctx.extra={music_id:musicId,music_size:size,music_mime:mime};
- return json(res,200,{ok:true,profile_music:data.profile_music,user:{id:data.id,username:data.username,profile_music:data.profile_music}});
-}
-case"user-settings":{const input=payload.settings&&"object"==typeof payload.settings&&!Array.isArray(payload.settings)?payload.settings:{},settings={};for(const key of settingFields){if(!Object.prototype.hasOwnProperty.call(input,key))continue;const value=input[key];if(["home_chat_enabled","manual_chat_join","chat_sound_enabled","post_notification_sound_enabled","ai_voice_auto_send","ai_voice_mode"].includes(key)){if("boolean"!=typeof value)throw fail(`設定値が不正です: ${key}`,400);settings[key]=value}else if(key==="ai_voice"){if(!["onyx","echo","nova","shimmer"].includes(value))throw fail("Invalid AI voice",400);settings[key]=value}else if("notification_volume"===key){const volume=Number(value);if(!Number.isFinite(volume)||volume<0||volume>1)throw fail("通知音量は0〜1で指定してください",400);settings[key]=volume}else if("home_chat_width"===key){const width=Number(value);if(!Number.isFinite(width)||width<240||width>760)throw fail("チャット幅は240〜760pxで指定してください",400);settings[key]=Math.round(width)}else if("default_chat_room"===key){const room=String(value||"room").trim();if(!room||room.length>100)throw fail("チャットルーム名が不正です",400);settings[key]=room}else if("chat_theme"===key){const theme=String(value||"blue");if(!["blue","green","red","dark"].includes(theme))throw fail("チャットテーマが不正です",400);settings[key]=theme}}if(!Object.keys(settings).length)throw fail("保存する設定がありません",400);const{data:data,error:error}=await db.from("users").update({settings:{...user.settings||{},...settings}}).eq("id",user.id).select("settings").single();if(error)throw error;return json(res,200,{ok:!0,settings:data.settings})}
-case"account-delete":{ctx.extra={role:user.role,points:Number(user.points||0),verified:!!user.verified};const{error:error}=await db.from("users").delete().eq("id",user.id);if(error)throw error;return json(res,200,{ok:!0})}
-case"stamp-purchase":{const stampUrl=String(payload.stampUrl||"");if(!stampUrl||stampUrl.length>2e3)throw fail("スタンプ購入内容が不正です",400);const stamps=Array.isArray(user.stamp_list)?user.stamp_list:[];if(stamps.includes(stampUrl))throw fail("このスタンプは購入済みです",409);const price=await getStickerPrice(stampUrl);if(null==price)throw fail("存在しないスタンプです",404);if(!Number.isInteger(price)||price<1)throw fail("このスタンプは購入不要です",400);if(Number(user.points||0)<price)throw fail("ポイントが足りません",400);const newStamps=[...stamps,stampUrl];return await updatePointsCas(db,user.id,user.points,{points:Number(user.points||0)-price,stamp_list:newStamps}),json(res,200,{ok:!0,points:Number(user.points||0)-price,stamp_list:newStamps})}
-case"transfer-points":{const targetUserId=requireId(payload.targetUserId,"送信先が不正です"),amount=Number(payload.amount);if(targetUserId===String(user.id)||!Number.isInteger(amount)||amount<1||amount>1e3)throw fail("ポイント送信内容が不正です",400);const{data:target,error:targetError}=await db.from("users").select("id,username").eq("id",targetUserId).maybeSingle();if(targetError)throw targetError;if(!target)throw fail("送信先が見つかりません",404);const{data:data,error:error}=await db.rpc("chanpro_transfer_points_atomic",{p_sender_id:user.id,p_target_id:targetUserId,p_amount:amount});if(error){if((error.message||"").includes("TARGET_NOT_FOUND"))throw fail("送信先が見つかりません",404);if((error.message||"").includes("INSUFFICIENT_POINTS"))throw fail("ポイントが足りません",400);if((error.message||"").includes("SELF_TRANSFER"))throw fail("自分には送信できません",400);throw error}await addNotifications(db,[{user_id:targetUserId,actor_id:user.id,type:"points_received",message:`${user.username}さんから${amount}ポイントを受け取りました`},{user_id:user.id,actor_id:targetUserId,type:"points_sent",message:`${target.username||"ユーザー"}さんに${amount}ポイントを送りました`}],{allowSelf:!0});await axiomLog("points_transferred",ip,{from_user_id:user.id,to_user_id:targetUserId,amount:amount});return json(res,200,{ok:!0,points:Number(data?.points),targetPoints:Number(data?.target_points)})}
-case"chat-points":{
- const messageId = requireId(payload.messageId);
- const roomName = validateChatRoomName(payload.roomName);
- const { data, error } = await db.rpc("chanpro_award_chat_points", { p_user_id: user.id, p_room: roomName, p_message_id: messageId });
- if (error) throw error;
- return json(res, 200, { ok: true, ...data });
-}
-case"user-login-streak":{
- const result = await db.rpc("chanpro_login_streak_atomic", { p_user_id: user.id });
- if (result.error && !missingRpc(result.error)) throw result.error;
- const data = result.error ? await awardLoginBonus(db, user.id) : unpackBonus(result.data);
- return json(res, 200, { ok: true, ...data });
-}
-case"weekly-points":{
- const result = await db.rpc("chanpro_award_weekly_post_bonus_atomic", { p_user_id: user.id });
- if (result.error && !missingRpc(result.error)) throw result.error;
- const data = result.error ? await awardWeeklyPostBonus(db, user.id) : unpackBonus(result.data);
- return json(res, 200, { ok: true, ...data });
-}
-case"image-upload":{if(!user)throw fail("ログインしてください",401);const result=await uploadImageToImgBB(db,payload,user,ip);await accessLogTask;return json(res,200,result)}
-case"image-register":{const imageUrl=String(payload.imageUrl||"");if(!imageUrl||imageUrl.length>5e3)throw fail("画像URLが不正です",400);const{error:error}=await db.from("chat_image_assets").insert({user_id:user.id,image_url:imageUrl,delete_url:payload.deleteUrl?String(payload.deleteUrl).slice(0,5e3):null});if(error)throw error;return json(res,200,{ok:!0})}
-case"chat-history-list":{const roomName=validateChatRoomName(payload.roomName),beforeId=payload.beforeId==null||payload.beforeId===""?null:Number(payload.beforeId);if(beforeId!==null&&(!Number.isSafeInteger(beforeId)||beforeId<1))throw fail("履歴カーソルが不正です",400);let q=db.from("room_chat_history").select("id,room_name,username,user_id,message,msg_id,reply_to,created_at").eq("room_name",roomName).order("id",{ascending:!1}).limit(50);if(beforeId!==null)q=q.lt("id",beforeId);const{data:rawRows,error:readError}=await q;if(readError)throw readError;const ids=[...new Set((rawRows||[]).map(r=>String(r.user_id||"").replace(/^id-/i,"")).filter(id=>SAFE_ID.test(id)))];let userMap=new Map;if(ids.length){const{data:users,error:userError}=await db.from("users").select("id,icon_url,verified,role").in("id",ids);if(userError)throw userError;userMap=new Map((users||[]).map(u=>[String(u.id),u]))}const rows=(rawRows||[]).reverse().map(row=>{const id=String(row.user_id||"").replace(/^id-/i,"");const u=userMap.get(id)||{};return{...row,icon_url:u.icon_url||"",verified:!!u.verified,role:u.role||"user"}});return json(res,200,{ok:!0,rows,hasMore:(rawRows||[]).length===50})}
-case"chat-history-add":{const message=String(payload.message||"").trim(),realtimeMessage=String(payload.realtimeMessage||message).trim();if(!message&&!realtimeMessage)throw fail("メッセージが空です",400);if(message.length>2e3)throw fail("メッセージが長すぎます",400);if(realtimeMessage.length>7e5)throw fail("メッセージが大きすぎます",400);const msgId=null==payload.msgId||""===payload.msgId?null:requireId(payload.msgId,"メッセージIDが不正です"),roomName=validateChatRoomName(payload.roomName);let replyTo=null;payload.replyTo&&"object"==typeof payload.replyTo&&(replyTo={msgId:payload.replyTo.msgId?String(payload.replyTo.msgId).slice(0,64):null,name:String(payload.replyTo.name||"").slice(0,100),snippet:String(payload.replyTo.snippet||"").slice(0,200)});let row = null;
-if (message) {
- const fields = "id,room_name,username,user_id,message,msg_id,reply_to,created_at";
- const authorId = "id-" + user.id;
- const { data, error } = await db.from("room_chat_history").insert({
-  room_name: roomName, username: user.username, user_id: authorId,
-  message, msg_id: msgId, reply_to: replyTo
- }).select(fields).single();
- if (error?.code === "23505" && msgId) {
-  const saved = await db.from("room_chat_history").select(fields).eq("room_name", roomName).eq("msg_id", msgId).eq("user_id", authorId).maybeSingle();
-  if (saved.error) throw saved.error;
-  if (!saved.data) throw fail("Message ID already used", 409);
-  row = saved.data;
- } else {
-  if (error) throw error;
-  row = data;
- }
-}
-const broadcastMessage={msgId:msgId,id:"id-"+user.id,name:user.username,icon_url:user.icon_url||"",profile:user.profile||"",points:Number(user.points)||0,verified:!!user.verified,role:user.role||"user",msg:realtimeMessage,time:row?new Date(row.created_at).getTime():Date.now(),replyTo:replyTo};const channel=db.channel("gather-chanpro-chat-"+encodeURIComponent(roomName),{config:{broadcast:{ack:!1,self:!1}}});try{if(typeof channel.httpSend!=="function")throw new Error("httpSend() を利用できません。@supabase/supabase-js 2.107.0以上に更新してください");const sent=await channel.httpSend("gather",{topic:`chanpro-chat/${roomName}/msg`,message:broadcastMessage});if(sent?.error||sent?.status==="error")throw sent.error||new Error("Supabase Realtimeへの配信に失敗しました")}catch(sendError){console.error("チャットRealtime httpSend失敗:",sendError?.message||sendError);throw fail("メッセージのRealtime配信に失敗しました。もう一度送信してください",503)}finally{try{await db.removeChannel(channel)}catch(_){}}return json(res,200,{ok:!0,message:row,broadcast:"httpSend",persisted:!!row})}
-case"chat-history-delete":{const rawMsgId=String(payload.msgId||""),roomName=validateChatRoomName(payload.roomName);let q=db.from("room_chat_history").delete().eq("room_name",roomName);if(/^db-\d+$/.test(rawMsgId))q=q.eq("id",Number(rawMsgId.slice(3)));else q=q.eq("msg_id",requireId(rawMsgId,"メッセージIDが不正です"));admin||(q=q.in("user_id",["id-"+user.id,String(user.id)]));const{data:deleted,error:error}=await q.select("id,msg_id,room_name");if(error)throw error;return json(res,200,{ok:!0,deleted:deleted||[],realtime:"postgres_changes"})}
-case"chat-pins-save":{const roomName=validateChatRoomName(payload.roomName),pins=Array.isArray(payload.pins)?payload.pins.slice(0,200):[],rows=pins.filter(p=>p&&p.msgId&&/^[A-Za-z0-9_-]{1,80}$/.test(String(p.msgId))).map(p=>({room_name:roomName,msg_id:String(p.msgId),name:String(p.name||"").slice(0,100),text:String(p.text||"").slice(0,500),raw:String(p.raw||p.text||"").slice(0,500),message_time:Math.max(0,Math.trunc(Number(p.time)||0)),pinned_by:user.username,pinned_at:new Date(Number(p.pinnedAt)||Date.now()).toISOString()}));const{data:existing,error:readError}=await db.from("chat_room_pins").select("msg_id").eq("room_name",roomName);if(readError)throw readError;const keep=new Set(rows.map(p=>p.msg_id)),remove=(existing||[]).map(p=>String(p.msg_id)).filter(id=>!keep.has(id));if(rows.length){const{error}=await db.from("chat_room_pins").upsert(rows,{onConflict:"room_name,msg_id"});if(error)throw error}if(remove.length){const{error}=await db.from("chat_room_pins").delete().eq("room_name",roomName).in("msg_id",remove);if(error)throw error}return json(res,200,{ok:!0,count:rows.length})}
-case"developer-message-read":{const ids=(Array.isArray(payload.ids)?payload.ids:[]).slice(0,100).map(v=>String(v)).filter(v=>/^[A-Za-z0-9_-]{1,64}$/.test(v));if(!ids.length)return json(res,200,{ok:!0});const{error:error}=await db.from("developer_messages").update({read:!0}).in("id",ids).eq("user_id",user.id);if(error)throw error;return json(res,200,{ok:!0})}
-case"developer-inbox-send":{const message=String(payload.message||"").trim();if(!message||message.length>2e3)throw fail("内容を入力してください(2000文字まで)",400);const{error:error}=await db.from("developer_inbox").insert({user_id:user.id,username:user.username,message:message});if(error)throw error;return json(res,200,{ok:!0})}
-case"ban":{if(!admin)throw fail("BAN権限がありません",403);const targetId=requireId(payload.targetUserId,"対象ユーザーが不正です"),minutes=Math.max(1,Math.min(525600,Number(payload.banMinutes)||5)),{data:target,error:targetError}=await db.from("users").select("id,role,ban_count,points").eq("id",targetId).maybeSingle();if(targetError)throw targetError;if(!target)throw fail("対象ユーザーが見つかりません",404);if("developer"===target.role&&"developer"!==user.role)throw fail("developerをBANできるのはdeveloperのみです",403);const banUntil=new Date(Date.now()+6e4*minutes).toISOString(),{error:error}=await db.from("users").update({ban_count:Number(target.ban_count||0)+1,ban_until:banUntil,points:Math.max(0,Number(target.points||0)-100)}).eq("id",targetId);if(error)throw error;return json(res,200,{ok:!0,banUntil:banUntil})}
-case"admin-user-update":{if(!admin)throw fail("管理者権限が必要です",403);const targetId=requireId(payload.targetUserId,"対象ユーザーが不正です"),{data:target,error:targetError}=await db.from("users").select("id,role,username").eq("id",targetId).maybeSingle();if(targetError)throw targetError;if(!target)throw fail("対象ユーザーが見つかりません",404);if("developer"===target.role&&"developer"!==user.role)throw fail("developerを変更できるのはdeveloperのみです",403);if(!0===payload.deleteAccount){ctx.extra={target_username:target.username,target_role:target.role};const{error:error}=await db.from("users").delete().eq("id",targetId);if(error)throw error;return json(res,200,{ok:!0,message:"ユーザーを削除しました"})}const patch={};if(Object.prototype.hasOwnProperty.call(payload,"role")){const role=String(payload.role);if(!["user","admin","developer"].includes(role))throw fail("ロールが不正です",400);if("developer"===role&&"developer"!==user.role)throw fail("developer権限の付与はdeveloperのみ可能です",403);patch.role=role}if(Object.prototype.hasOwnProperty.call(payload,"verified")){if("boolean"!=typeof payload.verified)throw fail("認証状態が不正です",400);patch.verified=payload.verified}const banKey=Object.prototype.hasOwnProperty.call(payload,"banUntil")?"banUntil":Object.prototype.hasOwnProperty.call(payload,"ban_until")?"ban_until":null;if(banKey){const v=payload[banKey];if(null===v)patch.ban_until=null;else{const d=new Date(v);if(Number.isNaN(d.getTime()))throw fail("BAN期限が不正です",400);patch.ban_until=d.toISOString()}}for(const key of["ban_count","points"])if(Object.prototype.hasOwnProperty.call(payload,key)){const n=Number(payload[key]);if(!Number.isFinite(n))throw fail(`${key} が不正です`,400);patch[key]=Math.trunc(n)}if(Object.prototype.hasOwnProperty.call(payload,"newPassword")){const password=String(payload.newPassword||"");if(password.length<8)throw fail("パスワードは8文字以上にしてください",400);patch.password_hash=sha256(password)}if(!Object.keys(patch).length)throw fail("変更内容を確認してください",400);const{error:error}=await db.from("users").update(patch).eq("id",targetId);if(error)throw error;return json(res,200,{ok:!0})}
-case"ip-ban":{if(!admin)throw fail("管理者権限が必要です",403);const rawIp=String(payload.ipAddress||"").trim();if(!rawIp||rawIp.length>100||!/^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(rawIp))throw fail("IPアドレスの形式が不正です",400);const minutes=Math.max(1,Math.min(525600,Number(payload.minutes)||60)),{error:error}=await db.from("banned_ip_addresses").upsert({ip_hash:hashIp(rawIp),reason:String(payload.reason||"管理者によるIP BAN").slice(0,300),expires_at:new Date(Date.now()+6e4*minutes).toISOString(),created_by:user.id},{onConflict:"ip_hash"});if(error)throw error;return json(res,200,{ok:!0,expiresAt:new Date(Date.now()+6e4*minutes).toISOString()})}
-case"ip-unban":{if(!admin)throw fail("管理者権限が必要です",403);const rawIp=String(payload.ipAddress||"").trim();if(!rawIp||rawIp.length>100||!/^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(rawIp))throw fail("IPアドレスの形式が不正です",400);const{error:error}=await db.from("banned_ip_addresses").delete().eq("ip_hash",hashIp(rawIp));if(error)throw error;return json(res,200,{ok:!0})}
-default:return json(res,400,{error:"未対応のAPI操作です",action:action})}}catch(error){return ctx.error=error.message||String(error),ctx.quiet=!!error.quiet,ctx.reason=error.reason,console.error("secure API error:",error.message||error),error.retryAfter&&res.setHeader("Retry-After",String(error.retryAfter)),json(res,error.status||500,{error:error.message||"サーバー処理に失敗しました",retryAfter:error.retryAfter||void 0,feature:error.feature||void 0})}};
-/* ---- [管理サイト連携] アクセスIPの保存(users.last_login_ip / users.ip_list: ログインしたIPを全部リストで保存) ---- */
-const ipSeen=new Map;
 
-async function recordUserIp(db,userId,rawIp,{login:login=!1}={}){const ip=normalizeIp(rawIp),key=userId+"|"+ip,now=Date.now();if(!ip||"unknown"===ip)return;if(!login&&(ipSeen.get(key)||0)>now-18e5)return;ipSeen.set(key,now),ipSeen.size>5e3&&ipSeen.clear();try{const{data:data,error:error}=await db.from("users").select("ip_list").eq("id",userId).maybeSingle();if(error)throw error;const iso=(new Date).toISOString(),list=Array.isArray(data?.ip_list)?data.ip_list:[],i=list.findIndex(x=>x&&x.ip===ip);i>=0?list[i]={...list[i],last:iso,n:Number(list[i].n||0)+1}:list.push({ip:ip,first:iso,last:iso,n:1}),list.sort((a,b)=>String(b.last).localeCompare(String(a.last)));const patch={ip_list:list.slice(0,300)};login&&(patch.last_login_ip=ip);const{error:updateError}=await db.from("users").update(patch).eq("id",userId);if(updateError)throw updateError}catch(e){console.warn("recordUserIp failed:",e?.message||e)}}
+module.exports = async (req, res) => {
+  const startedAt = Date.now();
+  const ctx = { action: 'unknown', user: null, ip: getClientIp(req), extra: null, images: [] };
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Cache-Control', 'no-store');
+  if (req.method === 'OPTIONS') return res.status(204).end();
 
-/* ---- [管理サイト連携] ユーザー操作ログ(Axiom)。パスワード・本文などの中身は記録しない ---- */
-const ACTIVITY_FIELDS=["icon_url","cover_url","profile","program_urls","profile_music","settings","newUsername","newPassword"];
+  let status = 200;
+  let payload = null;
+  let error = null;
+  try {
+    if (req.method !== 'POST') throw Object.assign(new Error('POST only'), { status: 405 });
+    const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+    ctx.action = String(body.action || 'unknown').slice(0, 40);
+    const upstreamBudget = ctx.action === 'image' ? 215000 : 90000;
+    ctx.signal = AbortSignal.timeout(Math.max(1, upstreamBudget - (Date.now() - startedAt)));
+    if (['chat', 'image', 'upload', 'speech'].includes(ctx.action)) {
+      console.info('AI request started', { action: ctx.action, requestId: req.headers['x-vercel-id'] });
+    }
 
-function describeAction(action,payload,out){const s=v=>String(null==v?"":v);switch(action){case"post-create":return["post_created",{post_id:s(out?.post?.id),is_limited:!!out?.post?.is_limited,length:s(payload.content).length,has_image:!!payload.image_url,has_poll:!!payload.poll,has_quote:!!payload.quote_post_id,bonus:Number(out?.postBonus?.bonus||0)}];case"post-delete":return["post_deleted",{post_id:s(payload.postId)}];case"reply-create":return["reply_created",{post_id:s(payload.post_id),reply_id:s(out?.reply?.id),length:s(payload.content).length}];case"reply-delete":return["reply_deleted",{reply_id:s(payload.replyId)}];case"post-like-toggle":return["like_toggled",{post_id:s(payload.postId),liked:!!out?.liked}];case"repost-toggle":return["repost_toggled",{post_id:s(payload.postId),reposted:!!out?.reposted}];case"bookmark-toggle":return["bookmark_toggled",{post_id:s(payload.postId),bookmarked:!!out?.bookmarked}];case"poll-vote":return["poll_voted",{post_id:s(payload.postId),option:Number(payload.optionIndex)}];case"follow-toggle":return["follow_toggled",{target_id:s(payload.targetUserId),following:!!out?.following}];case"dm-send":return["dm_sent",{recipient_id:s(payload.recipientId),length:s(payload.content).length}];case"report":return["report_submitted",{kind:"report",length:s(payload.message).length}];case"report-create":return["report_submitted",{kind:"user",target_id:s(payload.targetUserId),post_id:s(payload.postId)||void 0}];case"stamp-purchase":return["stamp_purchased",{points_after:Number(out?.points)}];case"chat-points":return["chat_points",{amount:Number(out?.amount||0),points_after:Number(out?.points)}];case"profile-music-save":return["profile_music_saved",{music_id:s(payload.music?.music_id),size_bytes:Number(payload.music?.size||0),mime:String(payload.music?.mime||"").slice(0,100)}];case"user-update":{const fields=ACTIVITY_FIELDS.filter(k=>Object.prototype.hasOwnProperty.call(payload,k)).map(k=>"newPassword"===k?"password":"newUsername"===k?"username":k);return["user_updated",{fields:fields.join(","),new_username:payload.newUsername?s(payload.newUsername).slice(0,100):void 0}]}case"account-delete":return["account_deleted",{}];case"ban":case"admin-user-update":case"ip-ban":case"ip-unban":if("admin-user-update"===action&&!0===payload.deleteAccount)return["account_deleted",{by_admin:!0,target_id:s(payload.targetUserId)}];return["admin_api_action",{op:action,target_id:s(payload.targetUserId)||void 0,role:payload.role,verified:payload.verified,delete_account:!0===payload.deleteAccount||void 0,minutes:payload.banMinutes??payload.minutes,ip:payload.ipAddress?s(payload.ipAddress):void 0}];default:return null}}
+    // 1) サーバー全体の停止(管理サイトの「停止設定」)
+    const [settingsCheck, ipCheck, authCheck] = await Promise.allSettled([
+      getSettings(), assertIpNotBanned(ctx.ip), authenticate(req)
+    ]);
+    if (settingsCheck.status === 'rejected') throw settingsCheck.reason;
+    const settings = settingsCheck.value;
+    if (!isOn(settings, 'server_enabled')) {
+      res.setHeader('Retry-After', '60');
+      throw Object.assign(new Error(textSetting(settings, 'server_disabled_message', '現在サーバーを停止しています。しばらくしてからもう一度お試しください')), { status: 503, code: 'server_disabled', maintenance: true });
+    }
+    // 2) IP BAN
+    if (ipCheck.status === 'rejected') throw ipCheck.reason;
+    // 3) 認証(BAN中のアカウントは拒否)
+    if (authCheck.status === 'rejected') throw authCheck.reason;
+    ctx.user = authCheck.value;
+    // 4) 機能ごとの停止(admin / developer は対象外)
+    const featureKey = FEATURE_OF_ACTION[ctx.action];
+    if (featureKey && !['admin', 'developer'].includes(ctx.user.role) && !isOn(settings, `feature_${featureKey}`)) {
+      throw Object.assign(new Error(textSetting(settings, `feature_${featureKey}_message`, `現在、「${AI_FEATURES[featureKey].label}」機能を停止しています。しばらくしてからもう一度お試しください`)), { status: 503, code: 'feature_disabled', feature: featureKey });
+    }
 
-// レスポンスを返した後に、アクセスログ(所要時間ms・HTTPステータスつき)・操作ログ・エラーログ・IP保存をまとめて行う(ユーザーを待たせない)
-async function afterResponse(req,res,ctx){const later=ctx.later.length?Promise.allSettled(ctx.later):null;if(!ctx.ip||ctx.blocked)return void(later&&await later);const status=Number(res.statusCode)||0,ms=Date.now()-ctx.t0,out=res.__out?.body,payload=ctx.body?.payload||{},user=ctx.user,base={ip_hash:ctx.ipHash,action:ctx.action,status:status,ms:ms},who=user?{user_id:String(user.id),username:String(user.username||"")}:{},authAction="login"===ctx.action||"register"===ctx.action,events=[];user&&events.push(["access",{...base,...who,page:String(ctx.body?.page||req.headers.referer||"").slice(0,300)}]);if(status>=400&&!ctx.quiet&&(!authAction||status>=500))events.push(["api_error",{...base,...who,message:String(ctx.error||out?.error||"").slice(0,300),reason:ctx.reason||void 0}]);else if(user&&status<400){const ev=describeAction(ctx.action,payload,out);ev&&events.push([ev[0],{...who,...ev[1],...ctx.extra}])}const now=(new Date).toISOString(),info=ipInfoCache.get(ctx.ip)||{};await axiomIngest(events.map(([type,props])=>({_time:now,source:"gather-api",type:type,ip:ctx.ip,...info,...props})));const uid=ctx.loginUserId||user?.id;uid&&ctx.db&&await recordUserIp(ctx.db,uid,ctx.ip,{login:!!ctx.loginUserId});later&&await later}
+    const user = ctx.user;
+    const db = getPool();
+    switch (ctx.action) {
+      case 'list': payload = await handleList(db, user); break;
+      case 'settings': payload = await handleGetSettings(db, user); break;
+      case 'save-settings': payload = await handleSaveSettings(db, user, body); break;
+      case 'delete': payload = await handleDeleteConversation(db, user, body); break;
+      case 'history': payload = await handleHistory(db, user, body); break;
+      case 'speech': payload = await handleSpeech(db, user, body, ctx); break;
+      case 'chat': payload = await handleChat(db, user, body, ctx); break;
+      case 'image': payload = await handleImage(db, user, body, ctx); break;
+      case 'upload': payload = await handleUpload(db, body, ctx); break;
+      default: throw Object.assign(new Error('未対応のAI操作です'), { status: 400 });
+    }
+  } catch (e) {
+    const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+    if (timedOut) {
+      e = Object.assign(new Error('AI処理がタイムアウトしました。'), { status: 504, code: 'ai_upstream_timeout' });
+    }
+    error = e;
+    status = Number(e.status) || 500;
+    if (!e.maintenance && !e.feature && e.code !== 'ip_banned') {
+      console.error('AI API error', {
+        action: ctx.action, status, code: e.code, requestId: req.headers['x-vercel-id'],
+        conversationId: ctx.extra?.conversation_id, latencyMs: Date.now() - startedAt,
+        message: e.message
+      });
+    }
+    payload = { ok: false, error: e.message || 'AI処理に失敗しました' };
+    if (e.code) payload.code = e.code;
+    if (ctx.savedInput && status !== 404) payload.savedInput = ctx.savedInput;
+    if (e.feature) payload.feature = e.feature;
+    if (e.maintenance) payload.maintenance = true;
+  }
+  try {
+    await writeAiLogs({ ctx, status, startedAt, error, req });
+  } finally {
+    sendJson(res, status, payload);
+  }
+};
 
-module.exports=async(req,res)=>{const ctx={t0:Date.now(),later:[]};try{await handle(req,res,ctx)}finally{try{await afterResponse(req,res,ctx)}catch(e){console.warn("afterResponse failed:",e?.message||e)}}};
-module.exports.config={api:{bodyParser:{sizeLimit:"4mb"}}};
+module.exports.config = { api: { bodyParser: { sizeLimit: '5mb' } } };
