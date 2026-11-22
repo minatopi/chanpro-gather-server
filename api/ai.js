@@ -2,6 +2,7 @@
 
 const mysql = require('mysql2/promise');
 const crypto = require('node:crypto');
+const { isIP } = require('node:net');
 const { createClient } = require('@supabase/supabase-js');
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
@@ -17,13 +18,14 @@ const AXIOM_DATASET = process.env.AXIOM_DATASET || 'chanpro';
 
 let pool;
 let supabase;
-const requestWindows = new Map();
+const VOICES = new Set(['onyx', 'echo', 'nova', 'shimmer']);
+const EXPRESSIONS = new Set(['normal', 'happy', 'sad', 'angry', 'surprised', 'sleepy', 'wink']);
 
 /* ================= 管理サイト連携: 停止設定(app_settings) ================= */
 // 管理サイトの「停止設定」と同じキー: server_enabled(全通信を拒否) / feature_ai_chat / feature_ai_image / feature_ai_upload
 // admin / developer は機能停止の対象外(サーバー全体の停止は全員が対象)
 const AI_FEATURES = {
-  ai_chat: { label: 'AIチャット', actions: ['chat', 'history', 'list', 'delete', 'settings', 'save-settings'] },
+  ai_chat: { label: 'AIチャット', actions: ['chat', 'speech', 'history', 'list', 'delete', 'settings', 'save-settings'] },
   ai_image: { label: 'AI画像生成', actions: ['image'] },
   ai_upload: { label: 'AI用の画像送信', actions: ['upload'] }
 };
@@ -49,11 +51,10 @@ const isOn = (map, key) => !(map.has(key) && map.get(key) === false);
 const textSetting = (map, key, fallback) => (typeof map.get(key) === 'string' && map.get(key)) || fallback;
 
 function getClientIp(req) {
-  const real = req.headers['x-real-ip'];
-  const forwarded = req.headers['x-forwarded-for'];
-  const raw = (Array.isArray(real) ? real[0] : real) || (Array.isArray(forwarded) ? forwarded[0] : String(forwarded || '').split(',')[0]);
-  const ip = String(raw || '').trim().replace(/^\[|\]$/g, '');
-  return ip && ip.length <= 100 && /^[0-9a-fA-F:.%a-zA-Z0-9_-]+$/.test(ip) ? ip : 'unknown';
+  const headers = req.headers;
+  const raw = headers['x-vercel-forwarded-for'] || headers['x-real-ip'] || headers['x-forwarded-for'] || req.socket?.remoteAddress;
+  const ip = String(Array.isArray(raw) ? raw[0] : raw || '').split(',')[0].trim().replace(/^\[|\]$/g, '');
+  return isIP(ip) ? ip : 'unknown';
 }
 function normalizeIp(ip) {
   let value = String(ip || '').trim().toLowerCase();
@@ -157,26 +158,27 @@ async function authenticate(req) {
   return session;
 }
 
-function rateLimit(userId, kind) {
-  const now = Date.now();
-  const config = kind === 'image' ? [4, 30 * 60 * 1000] : kind === 'upload' ? [12, 10 * 60 * 1000] : [30, 5 * 60 * 1000];
-  const [limit, windowMs] = config;
-  const key = `${userId}:${kind}`;
-  let current = requestWindows.get(key);
-  if (!current || now - current.startedAt >= windowMs) current = { startedAt: now, count: 0 };
-  if (current.count >= limit) {
-    requestWindows.set(key, current);
-    throw Object.assign(new Error(kind === 'image'
-      ? '画像生成の回数制限に達しました。しばらく待ってから再度お試しください'
-      : kind === 'upload' ? '画像の送信回数が多すぎます。しばらく待ってください'
-      : '送信回数が多すぎます。少し待ってから再度お試しください'), { status: 429, code: 'rate_limited' });
-  }
-  current.count++;
-  requestWindows.set(key, current);
-  // Mapを際限なく増やさず、期限切れのカウンターを定期的に掃除する
-  if (requestWindows.size > 1200) {
-    for (const [k, v] of requestWindows) if (now - v.startedAt > 60 * 60 * 1000) requestWindows.delete(k);
-    if (requestWindows.size > 2000) requestWindows.clear();
+async function rateLimit(db, ip, kind) {
+  const [limit, seconds] = {
+    image: [4, 1800], upload: [12, 600], speech: [30, 300], chat: [30, 300]
+  }[kind];
+  const normalized = normalizeIp(ip);
+  const canonical = isIP(normalized) === 6 ? new URL('http://[' + normalized + ']').hostname : normalized;
+  const key = crypto.createHmac('sha256', IP_HASH_SECRET || SESSION_SECRET).update(canonical).digest('hex');
+  await db.execute(
+    'INSERT IGNORE INTO ai_ip_limits (ip_key, action, window_start, request_count) VALUES (?, ?, UNIX_TIMESTAMP(), 0)',
+    [key, kind]
+  );
+  const [result] = await db.execute(
+    `UPDATE ai_ip_limits
+        SET request_count = IF(window_start <= UNIX_TIMESTAMP() - ?, 1, request_count + 1),
+            window_start = IF(window_start <= UNIX_TIMESTAMP() - ?, UNIX_TIMESTAMP(), window_start)
+      WHERE ip_key = ? AND action = ?
+        AND (window_start <= UNIX_TIMESTAMP() - ? OR request_count < ?)`,
+    [seconds, seconds, key, kind, seconds, limit]
+  );
+  if (result.affectedRows !== 1) {
+    throw Object.assign(new Error('\u5229\u7528\u56de\u6570\u306e\u4e0a\u9650\u306b\u9054\u3057\u307e\u3057\u305f\u3002\u6642\u9593\u3092\u304a\u3044\u3066\u304a\u8a66\u3057\u304f\u3060\u3055\u3044\u3002'), { status: 429, code: 'rate_limited' });
   }
 }
 
@@ -250,7 +252,7 @@ async function handleHistory(db, user, body) {
   return { ok: true, conversation: { ...conversation, id: String(conversation.id) }, messages: rows.map(row => ({ ...row, id: String(row.id) })) };
 }
 
-async function callOpenAIChat(messages, user, customSystemPrompt, signal) {
+async function callOpenAIChat(messages, user, customSystemPrompt, signal, voiceMode) {
   if (!OPENAI_API_KEY) throw Object.assign(new Error('Vercel環境変数 OPENAI_API_KEY が設定されていません'), { status: 503 });
   const formatted = messages.map(row => {
     if (row.image_url) {
@@ -268,6 +270,10 @@ async function callOpenAIChat(messages, user, customSystemPrompt, signal) {
       model: OPENAI_CHAT_MODEL,
       messages: [
         { role: 'system', content: (String(customSystemPrompt || '').trim() || 'あなたはChanProのAIアシスタントです。日本語で、わかりやすく、正確に回答してください。必要なら箇条書きで整理し、分からないことは分からないと伝えてください。ユーザーが画像を送った場合は、その画像の内容を確認して回答してください。').slice(0, 6000) },
+        ...(voiceMode ? [{
+          role: 'system',
+          content: 'For the voice interface, start with exactly one label on its own line: [normal], [happy], [sad], [angry], [surprised], [sleepy] or [wink]. Pick the expression that best fits your reply, then write the actual answer on the next line. Use natural spoken language and keep the answer brief when the request allows it.'
+        }] : []),
         ...formatted
       ],
       max_completion_tokens: 2500,
@@ -287,7 +293,11 @@ async function callOpenAIChat(messages, user, customSystemPrompt, signal) {
   const content = data?.choices?.[0]?.message?.content;
   const answer = typeof content === 'string' ? content.trim() : '';
   if (!answer) throw Object.assign(new Error('AIから回答を取得できませんでした'), { status: 502 });
-  return answer;
+  if (!voiceMode) return { answer, expression: 'normal' };
+  const marker = answer.match(/^\[([a-z]+)\][ \t]*\r?\n/i);
+  const expression = marker?.[1].toLowerCase();
+  const text = marker && EXPRESSIONS.has(expression) ? answer.slice(marker[0].length).trim() : answer;
+  return { answer: text || answer, expression: EXPRESSIONS.has(expression) ? expression : 'normal' };
 }
 
 function validateImgBBUrl(value) {
@@ -323,7 +333,7 @@ async function handleDeleteConversation(db, user, body) {
 }
 
 async function handleChat(db, user, body, ctx) {
-  rateLimit(user.id, 'chat');
+  await rateLimit(db, ctx.ip, 'chat');
   const message = String(body.message || '').trim();
   const imageUrl = body.imageUrl ? validateImgBBUrl(body.imageUrl) : null;
   if (!message && !imageUrl) throw Object.assign(new Error('メッセージまたは画像を入力してください'), { status: 400 });
@@ -354,15 +364,41 @@ async function handleChat(db, user, body, ctx) {
     [conversationId, user.id]
   ), db.execute('SELECT system_prompt FROM ai_user_settings WHERE user_id = ? LIMIT 1', [user.id])]);
   if (imageUrl) ctx.images.push({ kind: 'upload', url: imageUrl, via: 'chat' });
-  const answer = await callOpenAIChat(history, user, settingsRows[0]?.system_prompt || '', ctx.signal);
+  const { answer, expression } = await callOpenAIChat(history, user, settingsRows[0]?.system_prompt || '', ctx.signal, body.voiceMode === true);
   const saved = await saveMessage(db, { conversationId, userId: user.id, role: 'assistant', content: answer });
   await updateConversationTime(db, conversationId, user.id);
   ctx.extra.answer_length = answer.length;
   return {
-    ok: true, conversationId, conversation: conversationSummary,
+    ok: true, conversationId, conversation: conversationSummary, expression,
     userMessage: ctx.savedInput.message,
     message: { ...saved, id: String(saved.id) }
   };
+}
+
+async function handleSpeech(db, user, body, ctx) {
+  const conversation = await getOwnedConversation(db, body.conversationId, user.id);
+  const messageId = String(body.messageId || '');
+  if (!/^\d{1,18}$/.test(messageId)) throw Object.assign(new Error('Invalid message ID'), { status: 400 });
+  const [rows] = await db.execute(
+    "SELECT content FROM ai_messages WHERE id = ? AND conversation_id = ? AND user_id = ? AND role = 'assistant' AND message_type = 'text'",
+    [messageId, conversation.id, user.id]
+  );
+  if (!rows[0]?.content) throw Object.assign(new Error('\u56de\u7b54\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093'), { status: 404 });
+  if (!OPENAI_API_KEY) throw Object.assign(new Error('OPENAI_API_KEY is not configured'), { status: 503 });
+  await rateLimit(db, ctx.ip, 'speech');
+  const voice = VOICES.has(body.voice) ? body.voice : 'onyx';
+  const response = await fetch('https://api.openai.com/v1/audio/speech', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini-tts', voice, input: Array.from(rows[0].content).slice(0, 1800).join(''), response_format: 'mp3'
+    }),
+    signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(40000)])
+  });
+  if (!response.ok) throw Object.assign(new Error('\u97f3\u58f0\u3092\u751f\u6210\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f'), {
+    status: response.status === 429 ? 429 : 502, code: `speech_${response.status}`
+  });
+  return { ok: true, audio: Buffer.from(await response.arrayBuffer()).toString('base64') };
 }
 
 async function uploadToImgBB(base64, signal, maxBytes = 3 * 1024 * 1024) {
@@ -395,8 +431,8 @@ async function uploadToImgBB(base64, signal, maxBytes = 3 * 1024 * 1024) {
   return { url: String(data.data.url), deleteUrl: data.data.delete_url ? String(data.data.delete_url) : null, size: bytes.length };
 }
 
-async function handleUpload(user, body, ctx) {
-  rateLimit(user.id, 'upload');
+async function handleUpload(db, body, ctx) {
+  await rateLimit(db, ctx.ip, 'upload');
   const up = await uploadToImgBB(body.imageBase64, ctx.signal);
   ctx.images.push({ kind: 'upload', url: up.url, delete_url: up.deleteUrl, size_bytes: up.size, via: 'upload' });
   return { ok: true, imageUrl: up.url };
@@ -432,7 +468,7 @@ async function callOpenAIImage(prompt, user, signal) {
 }
 
 async function handleImage(db, user, body, ctx) {
-  rateLimit(user.id, 'image');
+  await rateLimit(db, ctx.ip, 'image');
   const prompt = cleanText(body.prompt, 3000, '画像の説明');
   ctx.extra = { prompt_length: prompt.length };
   let conversation;
@@ -530,7 +566,7 @@ module.exports = async (req, res) => {
     ctx.action = String(body.action || 'unknown').slice(0, 40);
     const upstreamBudget = ctx.action === 'image' ? 215000 : 90000;
     ctx.signal = AbortSignal.timeout(Math.max(1, upstreamBudget - (Date.now() - startedAt)));
-    if (['chat', 'image', 'upload'].includes(ctx.action)) {
+    if (['chat', 'image', 'upload', 'speech'].includes(ctx.action)) {
       console.info('AI request started', { action: ctx.action, requestId: req.headers['x-vercel-id'] });
     }
 
@@ -563,9 +599,10 @@ module.exports = async (req, res) => {
       case 'save-settings': payload = await handleSaveSettings(db, user, body); break;
       case 'delete': payload = await handleDeleteConversation(db, user, body); break;
       case 'history': payload = await handleHistory(db, user, body); break;
+      case 'speech': payload = await handleSpeech(db, user, body, ctx); break;
       case 'chat': payload = await handleChat(db, user, body, ctx); break;
       case 'image': payload = await handleImage(db, user, body, ctx); break;
-      case 'upload': payload = await handleUpload(user, body, ctx); break;
+      case 'upload': payload = await handleUpload(db, body, ctx); break;
       default: throw Object.assign(new Error('未対応のAI操作です'), { status: 400 });
     }
   } catch (e) {
