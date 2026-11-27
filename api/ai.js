@@ -7,6 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || 'gpt-6-luna';
+const OPENAI_COMPARE_MODEL = process.env.OPENAI_COMPARE_MODEL || 'gpt-4.1-mini';
 const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2.6-flare';
 const IMGBB_API_KEY = process.env.IMGBB_API_KEY || '';
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
@@ -209,19 +210,29 @@ async function createConversation(db, user, title) {
   return { id: String(result.insertId), title: name };
 }
 
-async function saveMessage(db, { conversationId, userId, role, messageType = 'text', content = '', imageUrl = null }) {
-  const [result] = await db.execute(
-    `INSERT INTO ai_messages
-      (conversation_id, user_id, role, message_type, content, image_url, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-    [conversationId, userId, role, messageType, content, imageUrl]
-  );
-  const [rows] = await db.execute(
-    `SELECT id, role, message_type, content, image_url, created_at
-       FROM ai_messages WHERE id = ? LIMIT 1`,
-    [result.insertId]
-  );
-  return rows[0];
+async function saveMessage(db, { conversationId, userId, role, messageType = 'text', content = '', imageUrl = null, imageUrls = [] }) {
+  const connection = await db.getConnection();
+  try {
+    await connection.query('BEGIN PESSIMISTIC');
+    const [conversation] = await connection.execute(
+      'SELECT id FROM ai_conversations WHERE id = ? AND user_id = ? FOR UPDATE', [conversationId, userId]
+    );
+    if (!conversation.length) throw Object.assign(new Error('\u4f1a\u8a71\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093'), { status: 404 });
+    const [result] = await connection.execute(
+      'INSERT INTO ai_messages (conversation_id,user_id,role,message_type,content,image_url,image_urls,created_at) VALUES (?,?,?,?,?,?,?,NOW())',
+      [conversationId, userId, role, messageType, content, imageUrl, imageUrls.length ? JSON.stringify(imageUrls) : null]
+    );
+    const [rows] = await connection.execute(
+      'SELECT id, role, message_type, content, image_url, image_urls, created_at FROM ai_messages WHERE id = ?', [result.insertId]
+    );
+    await connection.commit();
+    return rows[0];
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 async function updateConversationTime(db, conversationId, userId) {
@@ -241,9 +252,9 @@ async function handleList(db, user) {
 async function handleHistory(db, user, body) {
   const conversation = await getOwnedConversation(db, body.conversationId, user.id);
   const [rows] = await db.execute(
-    `SELECT id, role, message_type, content, image_url, created_at
+    `SELECT id, role, message_type, content, image_url, image_urls, created_at
        FROM (
-         SELECT id, role, message_type, content, image_url, created_at
+         SELECT id, role, message_type, content, image_url, image_urls, created_at
            FROM ai_messages WHERE conversation_id = ? AND user_id = ?
           ORDER BY id DESC LIMIT 60
        ) recent ORDER BY id ASC`,
@@ -252,13 +263,30 @@ async function handleHistory(db, user, body) {
   return { ok: true, conversation: { ...conversation, id: String(conversation.id) }, messages: rows.map(row => ({ ...row, id: String(row.id) })) };
 }
 
-async function callOpenAIChat(messages, user, customSystemPrompt, signal, voiceMode) {
+function readImageUrls(row) {
+  let images = row.image_urls;
+  if (typeof images === 'string') {
+    try { images = JSON.parse(images); } catch { images = []; }
+  }
+  return Array.isArray(images) && images.length ? images : row.image_url ? [row.image_url] : [];
+}
+
+function inputImageUrls(body) {
+  const images = body.imageUrls ?? (body.imageUrl ? [body.imageUrl] : []);
+  if (!Array.isArray(images) || images.length > 4) {
+    throw Object.assign(new Error('\u753b\u50cf\u306f4\u679a\u307e\u3067\u6dfb\u4ed8\u3067\u304d\u307e\u3059'), { status: 400 });
+  }
+  return [...new Set(images.map(validateImgBBUrl))];
+}
+
+async function callOpenAIChat(messages, user, customSystemPrompt, signal, voiceMode, model = OPENAI_CHAT_MODEL) {
   if (!OPENAI_API_KEY) throw Object.assign(new Error('Vercel環境変数 OPENAI_API_KEY が設定されていません'), { status: 503 });
   const formatted = messages.map(row => {
-    if (row.image_url) {
+    const images = readImageUrls(row);
+    if (row.role === 'user' && images.length) {
       return { role: row.role, content: [
         { type: 'text', text: String(row.content || 'この画像を確認してください').slice(0, 12000) },
-        { type: 'image_url', image_url: { url: row.image_url, detail: 'auto' } }
+        ...images.map(url => ({ type: 'image_url', image_url: { url, detail: 'auto' } }))
       ] };
     }
     return { role: row.role, content: String(row.content || '').slice(0, 12000) };
@@ -267,7 +295,7 @@ async function callOpenAIChat(messages, user, customSystemPrompt, signal, voiceM
     method: 'POST',
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: OPENAI_CHAT_MODEL,
+      model,
       messages: [
         { role: 'system', content: (String(customSystemPrompt || '').trim() || 'あなたはChanProのAIアシスタントです。日本語で、わかりやすく、正確に回答してください。必要なら箇条書きで整理し、分からないことは分からないと伝えてください。ユーザーが画像を送った場合は、その画像の内容を確認して回答してください。').slice(0, 6000) },
         ...(voiceMode ? [{
@@ -304,8 +332,14 @@ function validateImgBBUrl(value) {
   const raw = String(value || '').trim();
   let url;
   try { url = new URL(raw); } catch (_) { throw Object.assign(new Error('画像URLが不正です'), { status: 400 }); }
-  if (url.protocol !== 'https:' || !/(^|\.)ibb\.co$|(^|\.)imgbb\.com$/i.test(url.hostname)) {
-    throw Object.assign(new Error('ImgBBに保存された画像だけ利用できます'), { status: 400 });
+  const storageOrigin = SUPABASE_URL ? new URL(SUPABASE_URL).origin : '';
+  // Keep existing attachments usable after switching new uploads back to ImgBB.
+  const storagePath = '/storage/v1/object/public/ai-input-images/';
+  const ownStorage = url.origin === storageOrigin && url.pathname.startsWith(storagePath)
+    && /^[a-f0-9-]{36}\.jpg$/i.test(url.pathname.slice(storagePath.length));
+  const imgBB = /(^|\.)ibb\.co$|(^|\.)imgbb\.com$/i.test(url.hostname);
+  if (url.protocol !== 'https:' || url.username || url.password || (!ownStorage && !imgBB)) {
+    throw Object.assign(new Error('\u5bfe\u5fdc\u3059\u308b\u753b\u50cfURL\u3092\u6307\u5b9a\u3057\u3066\u304f\u3060\u3055\u3044'), { status: 400 });
   }
   return url.toString();
 }
@@ -327,15 +361,34 @@ async function handleSaveSettings(db, user, body) {
 }
 
 async function handleDeleteConversation(db, user, body) {
-  const conversation = await getOwnedConversation(db, body.conversationId, user.id);
-  await db.execute('DELETE FROM ai_conversations WHERE id = ? AND user_id = ?', [conversation.id, user.id]);
-  return { ok: true, deleted: true, conversationId: String(conversation.id) };
+  const id = String(body.conversationId || '');
+  if (!/^\d{1,18}$/.test(id)) throw Object.assign(new Error('Invalid conversation ID'), { status: 400 });
+  const connection = await db.getConnection();
+  try {
+    await connection.query('BEGIN PESSIMISTIC');
+    const [rows] = await connection.execute(
+      'SELECT id FROM ai_conversations WHERE id = ? AND user_id = ? FOR UPDATE', [id, user.id]
+    );
+    if (!rows.length) throw Object.assign(new Error('\u4f1a\u8a71\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093'), { status: 404 });
+    await connection.execute('DELETE FROM ai_messages WHERE conversation_id = ? AND user_id = ?', [id, user.id]);
+    await connection.execute('DELETE FROM ai_conversations WHERE id = ? AND user_id = ?', [id, user.id]);
+    await connection.commit();
+    return { ok: true, deleted: true, conversationId: id };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 async function handleChat(db, user, body, ctx) {
   await rateLimit(db, ctx.ip, 'chat');
   const message = String(body.message || '').trim();
-  const imageUrl = body.imageUrl ? validateImgBBUrl(body.imageUrl) : null;
+  const imageUrls = inputImageUrls(body);
+  const imageUrl = imageUrls[0] || null;
+  const compare = body.compare === true && OPENAI_COMPARE_MODEL !== OPENAI_CHAT_MODEL;
+  if (compare) await rateLimit(db, ctx.ip, 'chat');
   if (!message && !imageUrl) throw Object.assign(new Error('メッセージまたは画像を入力してください'), { status: 400 });
   if (message.length > 12000) throw Object.assign(new Error('メッセージは12,000文字以内にしてください'), { status: 400 });
   ctx.extra = { message_length: message.length, has_image: !!imageUrl, new_conversation: !body.conversationId };
@@ -351,20 +404,37 @@ async function handleChat(db, user, body, ctx) {
   const userMessage = await saveMessage(db, {
     conversationId, userId: user.id, role: 'user',
     messageType: imageUrl ? 'image' : 'text',
-    content: message || 'この画像について教えてください。', imageUrl
+    content: message || 'この画像について教えてください。', imageUrl, imageUrls
   });
   ctx.savedInput = { conversation: conversationSummary, message: { ...userMessage, id: String(userMessage.id) } };
   // 直近12件だけをAIへ渡す。古い会話全体を毎回読み込まないことでDB負荷を抑える。
   const [[history], [settingsRows]] = await Promise.all([db.execute(
-    `SELECT role, message_type, content, image_url FROM (
-       SELECT role, message_type, content, image_url, id FROM ai_messages
+    `SELECT role, message_type, content, image_url, image_urls FROM (
+       SELECT role, message_type, content, image_url, image_urls, id FROM ai_messages
         WHERE conversation_id = ? AND user_id = ?
         ORDER BY id DESC LIMIT 12
      ) recent ORDER BY id ASC`,
     [conversationId, user.id]
   ), db.execute('SELECT system_prompt FROM ai_user_settings WHERE user_id = ? LIMIT 1', [user.id])]);
-  if (imageUrl) ctx.images.push({ kind: 'upload', url: imageUrl, via: 'chat' });
-  const { answer, expression } = await callOpenAIChat(history, user, settingsRows[0]?.system_prompt || '', ctx.signal, body.voiceMode === true);
+  for (const url of imageUrls) ctx.images.push({ kind: 'upload', url, via: 'chat' });
+  const system = settingsRows[0]?.system_prompt || '';
+  const primary = callOpenAIChat(history, user, system, ctx.signal, body.voiceMode === true);
+  let reply;
+  if (compare) {
+    const results = await Promise.allSettled([
+      primary, callOpenAIChat(history, user, system, ctx.signal, false, OPENAI_COMPARE_MODEL)
+    ]);
+    const fulfilled = results.find(result => result.status === 'fulfilled');
+    if (!fulfilled) throw results[0].reason;
+    const models = [OPENAI_CHAT_MODEL, OPENAI_COMPARE_MODEL];
+    reply = {
+      expression: fulfilled.value.expression,
+      answer: results.map((result, index) => '## ' + models[index] + '\n' + (
+        result.status === 'fulfilled' ? result.value.answer : '\u56de\u7b54\u3092\u53d6\u5f97\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f'
+      )).join('\n\n')
+    };
+  } else reply = await primary;
+  const { answer, expression } = reply;
   const saved = await saveMessage(db, { conversationId, userId: user.id, role: 'assistant', content: answer });
   await updateConversationTime(db, conversationId, user.id);
   ctx.extra.answer_length = answer.length;
@@ -386,12 +456,22 @@ async function handleSpeech(db, user, body, ctx) {
   if (!rows[0]?.content) throw Object.assign(new Error('\u56de\u7b54\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093'), { status: 404 });
   if (!OPENAI_API_KEY) throw Object.assign(new Error('OPENAI_API_KEY is not configured'), { status: 503 });
   await rateLimit(db, ctx.ip, 'speech');
+  const delivery = {
+    happy: 'Bright, delighted, and genuinely enthusiastic, with a smile in the voice.',
+    sad: 'Gentle, unhurried, and compassionate, with soft pauses.',
+    angry: 'Firm and emphatic, with controlled intensity and no shouting.',
+    surprised: 'Start with audible surprise, then settle into an engaged, animated delivery.',
+    sleepy: 'Soft and relaxed, with a slower pace.',
+    wink: 'Playful and lightly mischievous.',
+    normal: 'Warm, expressive, and conversational; vary emphasis and pacing naturally.'
+  };
+  const expression = EXPRESSIONS.has(body.expression) ? body.expression : 'normal';
   const voice = VOICES.has(body.voice) ? body.voice : 'onyx';
   const response = await fetch('https://api.openai.com/v1/audio/speech', {
     method: 'POST',
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'gpt-4o-mini-tts', voice, input: Array.from(rows[0].content).slice(0, 1800).join(''), response_format: 'mp3'
+      model: 'gpt-4o-mini-tts', voice, instructions: delivery[expression], input: Array.from(rows[0].content).slice(0, 1800).join(''), response_format: 'mp3'
     }),
     signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(40000)])
   });
@@ -438,9 +518,10 @@ async function handleUpload(db, body, ctx) {
   return { ok: true, imageUrl: up.url };
 }
 
-async function callOpenAIImage(prompt, user, signal) {
+async function callOpenAIImage(prompt, user, signal, imageUrls) {
   if (!OPENAI_API_KEY) throw Object.assign(new Error('Vercel環境変数 OPENAI_API_KEY が設定されていません'), { status: 503 });
-  const response = await fetch('https://api.openai.com/v1/images/generations', {
+  const editing = imageUrls.length > 0;
+  const response = await fetch('https://api.openai.com/v1/images/' + (editing ? 'edits' : 'generations'), {
     method: 'POST',
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -448,9 +529,11 @@ async function callOpenAIImage(prompt, user, signal) {
       prompt,
       n: 1,
       size: '1024x1024',
-      quality: 'medium',
-      output_format: 'png',
-      safety_identifier: crypto.createHash('sha256').update(String(user.id)).digest('hex').slice(0, 64)
+      quality: 'low',
+      output_format: 'webp',
+      output_compression: 75,
+      ...(editing ? { images: imageUrls.map(image_url => ({ image_url })) }
+        : { safety_identifier: crypto.createHash('sha256').update(String(user.id)).digest('hex').slice(0, 64) })
     }),
     signal: AbortSignal.any([signal, AbortSignal.timeout(180000)])
   });
@@ -469,20 +552,22 @@ async function callOpenAIImage(prompt, user, signal) {
 
 async function handleImage(db, user, body, ctx) {
   await rateLimit(db, ctx.ip, 'image');
+  const imageUrls = inputImageUrls(body);
   const prompt = cleanText(body.prompt, 3000, '画像の説明');
-  ctx.extra = { prompt_length: prompt.length };
+  ctx.extra = { prompt_length: prompt.length, image_count: imageUrls.length };
   let conversation;
   if (body.conversationId) {
     conversation = await getOwnedConversation(db, body.conversationId, user.id);
   } else {
-    conversation = await createConversation(db, user, `画像生成: ${prompt.slice(0, 65)}`);
+    conversation = await createConversation(db, user, (imageUrls.length ? "\u753b\u50cf\u7de8\u96c6: " : "\u753b\u50cf\u751f\u6210: ") + prompt.slice(0, 65));
   }
   const conversationId = String(conversation.id);
   const conversationSummary = { id: conversationId, title: conversation.title };
   ctx.extra.conversation_id = conversationId;
-  const userMessage = await saveMessage(db, { conversationId, userId: user.id, role: 'user', content: `画像生成: ${prompt}` });
+  const userMessage = await saveMessage(db, { conversationId, userId: user.id, role: 'user', content: (imageUrls.length ? '\u753b\u50cf\u7de8\u96c6: ' : '\u753b\u50cf\u751f\u6210: ') + prompt, imageUrl: imageUrls[0], imageUrls });
   ctx.savedInput = { conversation: conversationSummary, message: { ...userMessage, id: String(userMessage.id) } };
-  const generated = await callOpenAIImage(prompt, user, ctx.signal);
+  for (const url of imageUrls) ctx.images.push({ kind: "upload", url, via: "image_edit" });
+  const generated = await callOpenAIImage(prompt, user, ctx.signal, imageUrls);
   const imageUrl = generated.url;
   ctx.images.push({ kind: 'generated', url: imageUrl, delete_url: generated.deleteUrl, size_bytes: generated.size, via: 'image', prompt: prompt.slice(0, 200) });
   const saved = await saveMessage(db, {
@@ -621,7 +706,7 @@ module.exports = async (req, res) => {
     }
     payload = { ok: false, error: e.message || 'AI処理に失敗しました' };
     if (e.code) payload.code = e.code;
-    if (ctx.savedInput) payload.savedInput = ctx.savedInput;
+    if (ctx.savedInput && status !== 404) payload.savedInput = ctx.savedInput;
     if (e.feature) payload.feature = e.feature;
     if (e.maintenance) payload.maintenance = true;
   }
