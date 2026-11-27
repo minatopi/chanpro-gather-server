@@ -3,6 +3,7 @@
 const mysql = require('mysql2/promise');
 const crypto = require('node:crypto');
 const { isIP } = require('node:net');
+const { waitUntil } = require('@vercel/functions');
 const { createClient } = require('@supabase/supabase-js');
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
@@ -18,6 +19,7 @@ const AXIOM_TOKEN = process.env.AXIOM_TOKEN || '';
 const AXIOM_DATASET = process.env.AXIOM_DATASET || 'chanpro';
 
 let pool;
+let aiDatabase;
 let supabase;
 const VOICES = new Set(['onyx', 'echo', 'nova', 'shimmer']);
 const EXPRESSIONS = new Set(['normal', 'happy', 'sad', 'angry', 'surprised', 'sleepy', 'wink']);
@@ -33,20 +35,34 @@ const AI_FEATURES = {
 const FEATURE_OF_ACTION = {};
 for (const [key, f] of Object.entries(AI_FEATURES)) for (const a of f.actions) FEATURE_OF_ACTION[a] = key;
 
-let settingsCache = { at: 0, map: new Map() };
+const SETTINGS_KEYS = ['server_enabled', 'server_disabled_message',
+  ...Object.keys(AI_FEATURES).flatMap(key => ['feature_' + key, 'feature_' + key + '_message'])];
+let settingsCache = { expires: 0, value: new Map() };
+let settingsRefresh;
 async function getSettings() {
-  if (Date.now() - settingsCache.at < 5000) return settingsCache.map;
-  const sb = getSupabase();
-  if (!sb) return settingsCache.map;
-  try {
-    const { data, error } = await sb.from('app_settings').select('key,value');
-    if (error) throw error;
-    settingsCache = { at: Date.now(), map: new Map((data || []).map(r => [r.key, r.value])) };
-  } catch (e) {
-    settingsCache.at = Date.now() - 3000; // 取得に失敗したら数秒後に再試行。失敗時は「稼働中」として扱う
-    console.warn('app_settings read failed:', e?.message || e);
+  if (Date.now() < settingsCache.expires) {
+    if (settingsCache.error) throw settingsCache.error;
+    return settingsCache.value;
   }
-  return settingsCache.map;
+  const sb = getSupabase();
+  if (!sb) return settingsCache.value;
+  if (!settingsRefresh) {
+    settingsRefresh = (async () => {
+      try {
+        const { data, error } = await sb.from('app_settings').select('key,value')
+          .in('key', SETTINGS_KEYS).abortSignal(AbortSignal.timeout(2500));
+        if (error) throw error;
+        settingsCache = { expires: Date.now() + 5000, value: new Map((data || []).map(row => [row.key, row.value])) };
+      } catch (error) {
+        console.warn('app_settings read failed:', error?.message || error);
+        const unavailable = Object.assign(new Error('\u0041I\u306e\u7a3c\u50cd\u8a2d\u5b9a\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093'), { status: 503, code: 'settings_unavailable' });
+        settingsCache = { expires: Date.now() + 1000, error: unavailable };
+        throw unavailable;
+      }
+      return settingsCache.value;
+    })().finally(() => { settingsRefresh = null; });
+  }
+  return settingsRefresh;
 }
 const isOn = (map, key) => !(map.has(key) && map.get(key) === false);
 const textSetting = (map, key, fallback) => (typeof map.get(key) === 'string' && map.get(key)) || fallback;
@@ -66,14 +82,50 @@ function hashIp(ip) {
   return crypto.createHash('sha256').update(IP_HASH_SECRET + ':' + normalizeIp(ip), 'utf8').digest('hex');
 }
 // BAN中のIPからはAI機能も使えない(secure.js と同じ banned_ip_addresses を参照)
+const ipBanCache = new Map();
 async function assertIpNotBanned(ip) {
   const sb = getSupabase();
   if (!sb || !IP_HASH_SECRET || ip === 'unknown') return;
-  const { data, error } = await sb.from('banned_ip_addresses').select('reason,expires_at').eq('ip_hash', hashIp(ip)).maybeSingle();
-  if (error) { console.warn('ip ban check failed:', error.message); return; }
+  const key = hashIp(ip);
+  let entry = ipBanCache.get(key);
+  if (!entry || Date.now() >= entry.expires) {
+    if (ipBanCache.size >= 512) ipBanCache.delete(ipBanCache.keys().next().value);
+    entry = { expires: Infinity };
+    ipBanCache.set(key, entry);
+    entry.result = (async () => {
+      const { data, error } = await sb.from('banned_ip_addresses').select('reason,expires_at')
+        .eq('ip_hash', key).abortSignal(AbortSignal.timeout(2500)).maybeSingle();
+      if (error) throw error;
+      entry.expires = Date.now() + 3000;
+      return data;
+    })().catch(error => {
+      if (ipBanCache.get(key) === entry) ipBanCache.delete(key);
+      console.warn('IP BAN lookup failed:', error?.message || error);
+      throw Object.assign(new Error('\u0049P\u5236\u9650\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093'), { status: 503, code: 'ip_check_failed' });
+    });
+  }
+  const data = await entry.result;
   if (data && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now())) {
     throw Object.assign(new Error(data.reason || 'このIPアドレスからのアクセスは禁止されています'), { status: 403, code: 'ip_banned', event: 'ip_banned_request' });
   }
+}
+
+function acquireAiConnection(pool) {
+  return new Promise((resolve, reject) => {
+    let expired = false;
+    const timeout = setTimeout(() => {
+      expired = true;
+      reject(Object.assign(new Error('\u0041I\u30c7\u30fc\u30bf\u30d9\u30fc\u30b9\u304c\u6df7\u307f\u5408\u3063\u3066\u3044\u307e\u3059'), { status: 503, code: 'db_busy' }));
+    }, 1800);
+    pool.getConnection().then(connection => {
+      clearTimeout(timeout);
+      if (expired) connection.release();
+      else resolve(connection);
+    }, error => {
+      clearTimeout(timeout);
+      if (!expired) reject(Object.assign(new Error('\u0041I\u30c7\u30fc\u30bf\u30d9\u30fc\u30b9\u306b\u63a5\u7d9a\u3067\u304d\u307e\u305b\u3093', { cause: error }), { status: 503, code: 'db_unavailable' }));
+    });
+  });
 }
 
 function getPool() {
@@ -93,11 +145,20 @@ function getPool() {
       connectionLimit: 3,
       maxIdle: 1,
       idleTimeout: 30000,
-      queueLimit: 20,
+      queueLimit: 6,
+      connectTimeout: 4000,
       enableKeepAlive: true
     });
+    aiDatabase = {
+      getConnection: () => acquireAiConnection(pool),
+      async execute(sql, params) {
+        const connection = await acquireAiConnection(pool);
+        try { return await connection.execute(sql, params); }
+        finally { connection.release(); }
+      }
+    };
   }
-  return pool;
+  return aiDatabase;
 }
 
 function getSupabase() {
@@ -134,21 +195,27 @@ function readSession(req) {
   let data;
   try { data = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')); }
   catch (_) { throw Object.assign(new Error('セッションが無効です'), { status: 401 }); }
-  if (data.iss !== 'chanpro-gather' || !data.sub || Number(data.exp) <= Math.floor(Date.now() / 1000)) {
+  if (data.iss !== 'chanpro-gather' || !data.sub || !Number.isFinite(Number(data.exp)) || Number(data.exp) <= Math.floor(Date.now() / 1000)) {
     throw Object.assign(new Error('セッションの有効期限が切れました。再ログインしてください'), { status: 401 });
   }
   return { id: String(data.sub), username: String(data.username || '') };
 }
 
-async function authenticate(req) {
-  const session = readSession(req);
+const userAuthInFlight = new Map();
+async function authenticate(session) {
   const sb = getSupabase();
   // users は従来どおり Supabase に置いたまま、削除・BAN状態を毎回確認する
   if (sb) {
-    const { data, error } = await sb.from('users')
-      .select('id,username,role,ban_until')
-      .eq('id', session.id)
-      .maybeSingle();
+    let lookup = userAuthInFlight.get(session.id);
+    if (!lookup) {
+      lookup = Promise.resolve(sb.from('users')
+        .select('id,username,role,ban_until')
+        .eq('id', session.id)
+        .abortSignal(AbortSignal.timeout(2500))
+        .maybeSingle()).finally(() => userAuthInFlight.delete(session.id));
+      userAuthInFlight.set(session.id, lookup);
+    }
+    const { data, error } = await lookup;
     if (error) throw error;
     if (!data) throw Object.assign(new Error('ユーザーが見つかりません。再ログインしてください'), { status: 401 });
     if (data.ban_until && new Date(data.ban_until).getTime() > Date.now()) {
@@ -159,26 +226,31 @@ async function authenticate(req) {
   return session;
 }
 
-async function rateLimit(db, ip, kind) {
+async function rateLimit(db, ip, kind, cost = 1) {
   const [limit, seconds] = {
     image: [4, 1800], upload: [12, 600], speech: [30, 300], chat: [30, 300]
   }[kind];
   const normalized = normalizeIp(ip);
   const canonical = isIP(normalized) === 6 ? new URL('http://[' + normalized + ']').hostname : normalized;
   const key = crypto.createHmac('sha256', IP_HASH_SECRET || SESSION_SECRET).update(canonical).digest('hex');
-  await db.execute(
-    'INSERT IGNORE INTO ai_ip_limits (ip_key, action, window_start, request_count) VALUES (?, ?, UNIX_TIMESTAMP(), 0)',
-    [key, kind]
-  );
-  const [result] = await db.execute(
+  const update = () => db.execute(
     `UPDATE ai_ip_limits
-        SET request_count = IF(window_start <= UNIX_TIMESTAMP() - ?, 1, request_count + 1),
+        SET request_count = IF(window_start <= UNIX_TIMESTAMP() - ?, ?, request_count + ?),
             window_start = IF(window_start <= UNIX_TIMESTAMP() - ?, UNIX_TIMESTAMP(), window_start)
       WHERE ip_key = ? AND action = ?
-        AND (window_start <= UNIX_TIMESTAMP() - ? OR request_count < ?)`,
-    [seconds, seconds, key, kind, seconds, limit]
+        AND (window_start <= UNIX_TIMESTAMP() - ? OR request_count <= ?)`,
+    [seconds, cost, cost, seconds, key, kind, seconds, limit - cost]
   );
-  if (result.affectedRows !== 1) {
+  const [updated] = await update();
+  if (updated.affectedRows === 1) return;
+  const [inserted] = await db.execute(
+    'INSERT IGNORE INTO ai_ip_limits (ip_key, action, window_start, request_count) VALUES (?, ?, UNIX_TIMESTAMP(), ?)',
+    [key, kind, cost]
+  );
+  if (inserted.affectedRows === 1) return;
+  // Another invocation can create or reset the row between our first two statements.
+  const [retry] = await update();
+  if (retry.affectedRows !== 1) {
     throw Object.assign(new Error('\u5229\u7528\u56de\u6570\u306e\u4e0a\u9650\u306b\u9054\u3057\u307e\u3057\u305f\u3002\u6642\u9593\u3092\u304a\u3044\u3066\u304a\u8a66\u3057\u304f\u3060\u3055\u3044\u3002'), { status: 429, code: 'rate_limited' });
   }
 }
@@ -190,9 +262,14 @@ function cleanText(value, max, label) {
   return text;
 }
 
-async function getOwnedConversation(db, conversationId, userId) {
+function parseConversationId(conversationId) {
   const id = String(conversationId || '');
   if (!/^\d{1,18}$/.test(id)) throw Object.assign(new Error('会話IDが不正です'), { status: 400 });
+  return id;
+}
+
+async function getOwnedConversation(db, conversationId, userId) {
+  const id = parseConversationId(conversationId);
   const [rows] = await db.execute(
     'SELECT id, title FROM ai_conversations WHERE id = ? AND user_id = ? LIMIT 1',
     [id, userId]
@@ -201,42 +278,45 @@ async function getOwnedConversation(db, conversationId, userId) {
   return rows[0];
 }
 
-async function createConversation(db, user, title) {
-  const name = String(title || '新しいチャット').replace(/\s+/g, ' ').slice(0, 80) || '新しいチャット';
-  const [result] = await db.execute(
-    'INSERT INTO ai_conversations (user_id, title, created_at, updated_at) VALUES (?, ?, NOW(), NOW())',
-    [user.id, name]
-  );
-  return { id: String(result.insertId), title: name };
-}
-
-async function saveMessage(db, { conversationId, userId, role, messageType = 'text', content = '', imageUrl = null, imageUrls = [] }) {
+async function saveMessage(db, { conversationId, newTitle, userId, role, messageType = 'text', content = '', imageUrl = null, imageUrls = [] }) {
   const connection = await db.getConnection();
   try {
     await connection.query('BEGIN PESSIMISTIC');
-    const [conversation] = await connection.execute(
-      'SELECT id FROM ai_conversations WHERE id = ? AND user_id = ? FOR UPDATE', [conversationId, userId]
-    );
-    if (!conversation.length) throw Object.assign(new Error('\u4f1a\u8a71\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093'), { status: 404 });
+    let title;
+    if (conversationId) {
+      conversationId = parseConversationId(conversationId);
+      const [rows] = await connection.execute(
+        'SELECT title FROM ai_conversations WHERE id = ? AND user_id = ? FOR UPDATE', [conversationId, userId]
+      );
+      if (!rows.length) throw Object.assign(new Error('\u4f1a\u8a71\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093'), { status: 404 });
+      title = rows[0].title;
+    } else {
+      title = String(newTitle || '\u65b0\u3057\u3044\u30c1\u30e3\u30c3\u30c8').replace(/\s+/g, ' ').trim().slice(0, 80);
+      const [created] = await connection.execute(
+        'INSERT INTO ai_conversations (user_id, title, created_at, updated_at) VALUES (?, ?, NOW(), NOW())', [userId, title]
+      );
+      conversationId = String(created.insertId);
+    }
+    const createdAt = new Date(Math.floor(Date.now() / 1000) * 1000);
     const [result] = await connection.execute(
-      'INSERT INTO ai_messages (conversation_id,user_id,role,message_type,content,image_url,image_urls,created_at) VALUES (?,?,?,?,?,?,?,NOW())',
-      [conversationId, userId, role, messageType, content, imageUrl, imageUrls.length ? JSON.stringify(imageUrls) : null]
+      'INSERT INTO ai_messages (conversation_id,user_id,role,message_type,content,image_url,image_urls,created_at) VALUES (?,?,?,?,?,?,?,?)',
+      [conversationId, userId, role, messageType, content, imageUrl, imageUrls.length ? JSON.stringify(imageUrls) : null, createdAt]
     );
-    const [rows] = await connection.execute(
-      'SELECT id, role, message_type, content, image_url, image_urls, created_at FROM ai_messages WHERE id = ?', [result.insertId]
-    );
+    if (role === 'assistant') {
+      await connection.execute('UPDATE ai_conversations SET updated_at = NOW() WHERE id = ? AND user_id = ?', [conversationId, userId]);
+    }
     await connection.commit();
-    return rows[0];
+    return {
+      conversation: { id: conversationId, title },
+      message: { id: String(result.insertId), role, message_type: messageType, content,
+        image_url: imageUrl, image_urls: imageUrls.length ? imageUrls : null, created_at: createdAt }
+    };
   } catch (error) {
     await connection.rollback();
     throw error;
   } finally {
     connection.release();
   }
-}
-
-async function updateConversationTime(db, conversationId, userId) {
-  await db.execute('UPDATE ai_conversations SET updated_at = NOW() WHERE id = ? AND user_id = ?', [conversationId, userId]);
 }
 
 async function handleList(db, user) {
@@ -383,41 +463,34 @@ async function handleDeleteConversation(db, user, body) {
 }
 
 async function handleChat(db, user, body, ctx) {
-  await rateLimit(db, ctx.ip, 'chat');
   const message = String(body.message || '').trim();
   const imageUrls = inputImageUrls(body);
   const imageUrl = imageUrls[0] || null;
   const compare = body.compare === true && OPENAI_COMPARE_MODEL !== OPENAI_CHAT_MODEL;
-  if (compare) await rateLimit(db, ctx.ip, 'chat');
+  await rateLimit(db, ctx.ip, 'chat', compare ? 2 : 1);
   if (!message && !imageUrl) throw Object.assign(new Error('メッセージまたは画像を入力してください'), { status: 400 });
   if (message.length > 12000) throw Object.assign(new Error('メッセージは12,000文字以内にしてください'), { status: 400 });
   ctx.extra = { message_length: message.length, has_image: !!imageUrl, new_conversation: !body.conversationId };
-  let conversation;
-  if (body.conversationId) {
-    conversation = await getOwnedConversation(db, body.conversationId, user.id);
-  } else {
-    conversation = await createConversation(db, user, (message || '画像について').slice(0, 80));
-  }
-  const conversationId = String(conversation.id);
-  const conversationSummary = { id: conversationId, title: conversation.title };
-  ctx.extra.conversation_id = conversationId;
-  const userMessage = await saveMessage(db, {
-    conversationId, userId: user.id, role: 'user',
-    messageType: imageUrl ? 'image' : 'text',
-    content: message || 'この画像について教えてください。', imageUrl, imageUrls
+  const { conversation: conversationSummary, message: userMessage } = await saveMessage(db, {
+    conversationId: body.conversationId, newTitle: message || '\u753b\u50cf\u306b\u3064\u3044\u3066', userId: user.id, role: 'user',
+    messageType: imageUrl ? 'image' : 'text', content: message || '\u3053\u306e\u753b\u50cf\u306b\u3064\u3044\u3066\u6559\u3048\u3066\u304f\u3060\u3055\u3044\u3002',
+    imageUrl, imageUrls
   });
-  ctx.savedInput = { conversation: conversationSummary, message: { ...userMessage, id: String(userMessage.id) } };
-  // 直近12件だけをAIへ渡す。古い会話全体を毎回読み込まないことでDB負荷を抑える。
-  const [[history], [settingsRows]] = await Promise.all([db.execute(
-    `SELECT role, message_type, content, image_url, image_urls FROM (
-       SELECT role, message_type, content, image_url, image_urls, id FROM ai_messages
-        WHERE conversation_id = ? AND user_id = ?
-        ORDER BY id DESC LIMIT 12
-     ) recent ORDER BY id ASC`,
-    [conversationId, user.id]
-  ), db.execute('SELECT system_prompt FROM ai_user_settings WHERE user_id = ? LIMIT 1', [user.id])]);
-  for (const url of imageUrls) ctx.images.push({ kind: 'upload', url, via: 'chat' });
-  const system = settingsRows[0]?.system_prompt || '';
+  const conversationId = conversationSummary.id;
+  ctx.extra.conversation_id = conversationId;
+  ctx.savedInput = { conversation: conversationSummary, message: userMessage };
+  const [rows] = await db.execute(
+    `SELECT id, role, message_type, content, image_url, image_urls, NULL AS system_prompt
+       FROM (SELECT id, role, message_type, content, image_url, image_urls FROM ai_messages
+              WHERE conversation_id = ? AND user_id = ? ORDER BY id DESC LIMIT 12) AS recent
+     UNION ALL
+     SELECT NULL, NULL, NULL, NULL, NULL, NULL, system_prompt
+       FROM ai_user_settings WHERE user_id = ?
+     ORDER BY id ASC`,
+    [conversationId, user.id, user.id]
+  );
+  const history = rows.filter(row => row.id != null);
+  const system = rows.find(row => row.id == null)?.system_prompt || '';
   const primary = callOpenAIChat(history, user, system, ctx.signal, body.voiceMode === true);
   let reply;
   if (compare) {
@@ -435,8 +508,7 @@ async function handleChat(db, user, body, ctx) {
     };
   } else reply = await primary;
   const { answer, expression } = reply;
-  const saved = await saveMessage(db, { conversationId, userId: user.id, role: 'assistant', content: answer });
-  await updateConversationTime(db, conversationId, user.id);
+  const { message: saved } = await saveMessage(db, { conversationId, userId: user.id, role: 'assistant', content: answer });
   ctx.extra.answer_length = answer.length;
   return {
     ok: true, conversationId, conversation: conversationSummary, expression,
@@ -483,21 +555,27 @@ async function handleSpeech(db, user, body, ctx) {
 
 async function uploadToImgBB(base64, signal, maxBytes = 3 * 1024 * 1024) {
   if (!IMGBB_API_KEY) throw Object.assign(new Error('Vercel環境変数 IMGBB_API_KEY が設定されていません'), { status: 503 });
-  const clean = String(base64 || '').replace(/^data:image\/[a-z0-9.+-]+;base64,/i, '').replace(/\s/g, '');
+  let clean = String(base64 || '').replace(/^data:image\/[a-z0-9.+-]+;base64,/i, '');
+  if (/\s/.test(clean)) clean = clean.replace(/\s/g, '');
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) throw Object.assign(new Error('画像データが不正です'), { status: 400 });
-  const bytes = Buffer.from(clean, 'base64');
-  if (!bytes.length || bytes.length > maxBytes) throw Object.assign(new Error(`画像は${Math.floor(maxBytes / 1024 / 1024)}MB以下にしてください`), { status: 413 });
+  const encodedLength = clean.length;
+  const padding = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0;
+  const size = Math.floor((encodedLength - padding) * 3 / 4);
+  if ((encodedLength - padding) % 4 === 1 || (padding && encodedLength % 4 !== 0)) {
+    throw Object.assign(new Error('Invalid base64 image'), { status: 400 });
+  }
+  if (!size || size > maxBytes) throw Object.assign(new Error('Image exceeds the upload size limit'), { status: 413 });
+  const bytes = Buffer.from(clean.slice(0, 16), 'base64');
   const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
   const isPng = bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
   const isWebp = bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP';
   if (!isJpeg && !isPng && !isWebp) throw Object.assign(new Error('JPEG・PNG・WebP画像のみ送信できます'), { status: 400 });
-  const form = new URLSearchParams();
+  const form = new FormData();
   form.set('image', clean);
   form.set('name', `chanpro-ai-${Date.now()}`);
   const response = await fetch(`https://api.imgbb.com/1/upload?key=${encodeURIComponent(IMGBB_API_KEY)}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: form.toString(),
+    body: form,
     signal: AbortSignal.any([signal, AbortSignal.timeout(45000)])
   });
   const data = await response.json().catch(error => {
@@ -508,7 +586,7 @@ async function uploadToImgBB(base64, signal, maxBytes = 3 * 1024 * 1024) {
     throw Object.assign(new Error(data?.error?.message || 'ImgBBへの画像保存に失敗しました'), { status: 502 });
   }
   // display_urlではなく、画像データをそのまま取得できる元URLを保存する
-  return { url: String(data.data.url), deleteUrl: data.data.delete_url ? String(data.data.delete_url) : null, size: bytes.length };
+  return { url: String(data.data.url), deleteUrl: data.data.delete_url ? String(data.data.delete_url) : null, size };
 }
 
 async function handleUpload(db, body, ctx) {
@@ -555,82 +633,71 @@ async function handleImage(db, user, body, ctx) {
   const imageUrls = inputImageUrls(body);
   const prompt = cleanText(body.prompt, 3000, '画像の説明');
   ctx.extra = { prompt_length: prompt.length, image_count: imageUrls.length };
-  let conversation;
-  if (body.conversationId) {
-    conversation = await getOwnedConversation(db, body.conversationId, user.id);
-  } else {
-    conversation = await createConversation(db, user, (imageUrls.length ? "\u753b\u50cf\u7de8\u96c6: " : "\u753b\u50cf\u751f\u6210: ") + prompt.slice(0, 65));
-  }
-  const conversationId = String(conversation.id);
-  const conversationSummary = { id: conversationId, title: conversation.title };
+  const label = imageUrls.length ? '\u753b\u50cf\u7de8\u96c6' : '\u753b\u50cf\u751f\u6210';
+  const { conversation: conversationSummary, message: userMessage } = await saveMessage(db, {
+    conversationId: body.conversationId, newTitle: label + ': ' + prompt, userId: user.id,
+    role: 'user', content: label + ': ' + prompt, imageUrl: imageUrls[0] || null, imageUrls
+  });
+  const conversationId = conversationSummary.id;
   ctx.extra.conversation_id = conversationId;
-  const userMessage = await saveMessage(db, { conversationId, userId: user.id, role: 'user', content: (imageUrls.length ? '\u753b\u50cf\u7de8\u96c6: ' : '\u753b\u50cf\u751f\u6210: ') + prompt, imageUrl: imageUrls[0], imageUrls });
-  ctx.savedInput = { conversation: conversationSummary, message: { ...userMessage, id: String(userMessage.id) } };
-  for (const url of imageUrls) ctx.images.push({ kind: "upload", url, via: "image_edit" });
+  ctx.savedInput = { conversation: conversationSummary, message: userMessage };
   const generated = await callOpenAIImage(prompt, user, ctx.signal, imageUrls);
   const imageUrl = generated.url;
   ctx.images.push({ kind: 'generated', url: imageUrl, delete_url: generated.deleteUrl, size_bytes: generated.size, via: 'image', prompt: prompt.slice(0, 200) });
-  const saved = await saveMessage(db, {
+  const { message: saved } = await saveMessage(db, {
     conversationId, userId: user.id, role: 'assistant', messageType: 'image',
     content: `画像を生成し、ImgBBに保存しました。\n内容: ${prompt}`,
     imageUrl
   });
-  await updateConversationTime(db, conversationId, user.id);
   return { ok: true, conversationId, conversation: conversationSummary, userMessage: ctx.savedInput.message, message: { ...saved, id: String(saved.id) } };
 }
 
 /* ================= Axiom ログ(管理サイトの「AI利用」「画像」で表示) ================= */
-const AXIOM_TIMEOUT_MS = 2500;
+const AXIOM_TIMEOUT_MS = 800;
 const blockedLogSeen = new Map();
+const quietAiReads = new Set(['list', 'settings', 'history']);
 
-async function ingestAxiom(events) {
-  if (!AXIOM_TOKEN) { console.warn('AI Axiom logging skipped: AXIOM_TOKEN is not configured'); return; }
-  if (!events.length) return;
+async function ingestAxiom(event) {
   try {
     const response = await fetch(`https://api.axiom.co/v1/datasets/${encodeURIComponent(AXIOM_DATASET)}/ingest`, {
       method: 'POST', headers: { Authorization: `Bearer ${AXIOM_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(events), signal: AbortSignal.timeout(AXIOM_TIMEOUT_MS)
+      body: JSON.stringify([event]), signal: AbortSignal.timeout(AXIOM_TIMEOUT_MS)
     });
     if (!response.ok) console.warn('AI Axiom log failed:', response.status);
-  } catch (logError) { console.warn('AI Axiom log failed:', logError?.message || logError); }
+  } catch (error) { console.warn('AI Axiom log failed:', error?.message || error); }
 }
 
-// レスポンスを返した後に実行する(ユーザーを待たせない)
-async function writeAiLogs({ ctx, status, startedAt, error, req }) {
-  const headers = req?.headers || {};
-  const latency = Math.max(0, Date.now() - Number(startedAt || Date.now()));
-  const now = new Date().toISOString();
-  const place = {
+function buildAiLog({ ctx, status, startedAt, error, req }) {
+  if (!AXIOM_TOKEN || (!error && quietAiReads.has(ctx.action))) return null;
+  const now = Date.now();
+  const headers = req.headers || {};
+  const event = {
+    _time: new Date(now).toISOString(), source: 'chanpro-ai-api', type: 'ai_api',
+    action: ctx.action, ip: ctx.ip, user_id: ctx.user?.id || null, username: ctx.user?.username || null,
+    request_id: headers['x-vercel-id'] || null, http_status: status, latency_ms: now - startedAt, ms: now - startedAt,
+    error_code: error?.code || null, error_message: error ? String(error.message || '').slice(0, 500) : null,
     country: headers['x-vercel-ip-country'] || null, region: headers['x-vercel-ip-country-region'] || null,
-    city: (() => { try { return headers['x-vercel-ip-city'] ? decodeURIComponent(headers['x-vercel-ip-city']) : null; } catch (_) { return null; } })()
+    ...(ctx.extra || {})
   };
-  const who = { user_id: ctx.user?.id ? String(ctx.user.id).slice(0, 64) : null, username: ctx.user?.username || null };
-  const events = [{
-    _time: now, source: 'chanpro-ai-api', type: 'ai_api',
-    action: String(ctx.action || 'unknown').slice(0, 40), ...who, ip: ctx.ip || null,
-    request_id: headers['x-vercel-id'] || null,
-    http_status: Number(status) || 500, latency_ms: latency, ms: latency,
-    error_code: error?.code ? String(error.code).slice(0, 80) : null,
-    error_message: error ? String(error.message || 'AI API error').slice(0, 500) : null,
-    method: req?.method || null, user_agent: String(headers['user-agent'] || '').slice(0, 200) || null,
-    ...place, ...(ctx.extra || {})
-  }];
-  if (error?.event === 'ip_banned_request') events.push({ _time: now, source: 'chanpro-ai-api', type: 'ip_banned_request', ip: ctx.ip, action: `ai:${ctx.action}`, reason: String(error.message).slice(0, 200), ...place });
-  if (error?.feature) {
-    const seenKey = `${ctx.user?.id || ctx.ip}|${error.feature}`;
-    if ((blockedLogSeen.get(seenKey) || 0) < Date.now() - 60000) {
-      blockedLogSeen.set(seenKey, Date.now()); if (blockedLogSeen.size > 3000) blockedLogSeen.clear();
-      events.push({ _time: now, source: 'chanpro-ai-api', type: 'feature_blocked', feature: error.feature, feature_label: AI_FEATURES[error.feature]?.label || error.feature, action: `ai:${ctx.action}`, ip: ctx.ip, ...who, ...place });
-    }
+  const image = ctx.images.find(item => item.delete_url || item.kind === 'generated' || ctx.action === 'upload');
+  if (image) Object.assign(event, {
+    type: error ? 'ai_api' : 'ai_image_upload', kind: image.kind, via: image.via,
+    url: image.url, delete_url: image.delete_url || undefined, size_bytes: image.size_bytes || undefined
+  });
+
+  const blockedType = error?.event || (error?.feature ? 'feature_blocked' : error?.maintenance ? 'server_blocked' : null);
+  if (blockedType) {
+    const key = blockedType === 'server_blocked' ? blockedType : blockedType + ':' + ctx.ip + ':' + (error.feature || '');
+    if (now - (blockedLogSeen.get(key) || 0) < 60000) return null;
+    if (blockedLogSeen.size >= 3000) blockedLogSeen.delete(blockedLogSeen.keys().next().value);
+    blockedLogSeen.set(key, now);
+    Object.assign(event, {
+      type: blockedType, action: 'ai:' + ctx.action, feature: error.feature,
+      feature_label: AI_FEATURES[error.feature]?.label,
+      reason: error.maintenance ? 'server_disabled' : String(error.message || '').slice(0, 200)
+    });
   }
-  if (error?.maintenance) {
-    const seenKey = 'server';
-    if ((blockedLogSeen.get(seenKey) || 0) < Date.now() - 30000) { blockedLogSeen.set(seenKey, Date.now()); events.push({ _time: now, source: 'chanpro-ai-api', type: 'server_blocked', action: `ai:${ctx.action}`, reason: 'server_disabled', ip: ctx.ip, ...place }); }
-  }
-  for (const image of ctx.images || []) {
-    events.push({ _time: now, source: 'chanpro-ai-api', type: 'ai_image_upload', ...who, ip: ctx.ip, kind: image.kind, via: image.via, url: image.url, delete_url: image.delete_url || undefined, size_bytes: image.size_bytes || undefined, prompt: image.prompt || undefined });
-  }
-  await ingestAxiom(events);
+  return event;
 }
 
 module.exports = async (req, res) => {
@@ -656,8 +723,9 @@ module.exports = async (req, res) => {
     }
 
     // 1) サーバー全体の停止(管理サイトの「停止設定」)
+    const session = readSession(req);
     const [settingsCheck, ipCheck, authCheck] = await Promise.allSettled([
-      getSettings(), assertIpNotBanned(ctx.ip), authenticate(req)
+      getSettings(), assertIpNotBanned(ctx.ip), authenticate(session)
     ]);
     if (settingsCheck.status === 'rejected') throw settingsCheck.reason;
     const settings = settingsCheck.value;
@@ -710,11 +778,9 @@ module.exports = async (req, res) => {
     if (e.feature) payload.feature = e.feature;
     if (e.maintenance) payload.maintenance = true;
   }
-  try {
-    await writeAiLogs({ ctx, status, startedAt, error, req });
-  } finally {
-    sendJson(res, status, payload);
-  }
+  const event = buildAiLog({ ctx, status, startedAt, error, req });
+  if (event) waitUntil(ingestAxiom(event));
+  sendJson(res, status, payload);
 };
 
 module.exports.config = { api: { bodyParser: { sizeLimit: '5mb' } } };
