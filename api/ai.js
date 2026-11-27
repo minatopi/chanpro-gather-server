@@ -1,10 +1,7 @@
 'use strict';
 
-const mysql = require('mysql2/promise');
 const crypto = require('node:crypto');
 const { isIP } = require('node:net');
-const { waitUntil } = require('@vercel/functions');
-const { createClient } = require('@supabase/supabase-js');
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || 'gpt-6-luna';
@@ -133,6 +130,7 @@ function getPool() {
     throw new Error('TiDB環境変数 TIDB_HOST / TIDB_USER / TIDB_PASSWORD / TIDB_DATABASE を設定してください');
   }
   if (!pool) {
+    const mysql = require('mysql2/promise');
     pool = mysql.createPool({
       host: process.env.TIDB_HOST,
       port: Number(process.env.TIDB_PORT || 4000),
@@ -164,6 +162,7 @@ function getPool() {
 function getSupabase() {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
   if (!supabase) {
+    const { createClient } = require('@supabase/supabase-js');
     supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
     });
@@ -707,7 +706,11 @@ module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Cache-Control', 'no-store');
-  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Max-Age', '600');
+    res.statusCode = 204;
+    return res.end();
+  }
 
   let status = 200;
   let payload = null;
@@ -779,7 +782,14 @@ module.exports = async (req, res) => {
     if (e.maintenance) payload.maintenance = true;
   }
   const event = buildAiLog({ ctx, status, startedAt, error, req });
-  if (event) waitUntil(ingestAxiom(event));
+  if (event) {
+    try {
+      const { waitUntil } = require('@vercel/functions');
+      waitUntil(ingestAxiom(event));
+    } catch (error) {
+      console.warn('AI background logging unavailable:', error?.message || error);
+    }
+  }
   sendJson(res, status, payload);
 };
 
