@@ -42,7 +42,7 @@ async function getSettings() {
     return settingsCache.value;
   }
   const sb = getSupabase();
-  if (!sb) return settingsCache.value;
+  if (!sb) throw Object.assign(new Error('AI\u306e\u7a3c\u50cd\u8a2d\u5b9a\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093'), { status: 503, code: 'settings_unavailable' });
   if (!settingsRefresh) {
     settingsRefresh = (async () => {
       try {
@@ -61,7 +61,10 @@ async function getSettings() {
   }
   return settingsRefresh;
 }
-const isOn = (map, key) => !(map.has(key) && map.get(key) === false);
+function isOn(map, key) {
+  const value = map.get(key);
+  return value !== false && value !== 0 && !['false', '0', 'off'].includes(String(value).trim().toLowerCase());
+}
 const textSetting = (map, key, fallback) => (typeof map.get(key) === 'string' && map.get(key)) || fallback;
 
 function getClientIp(req) {
@@ -741,9 +744,8 @@ module.exports = async (req, res) => {
     // 3) 認証(BAN中のアカウントは拒否)
     if (authCheck.status === 'rejected') throw authCheck.reason;
     ctx.user = authCheck.value;
-    // 4) 機能ごとの停止(admin / developer は対象外)
     const featureKey = FEATURE_OF_ACTION[ctx.action];
-    if (featureKey && !['admin', 'developer'].includes(ctx.user.role) && !isOn(settings, `feature_${featureKey}`)) {
+    if (featureKey && !isOn(settings, `feature_${featureKey}`)) {
       throw Object.assign(new Error(textSetting(settings, `feature_${featureKey}_message`, `現在、「${AI_FEATURES[featureKey].label}」機能を停止しています。しばらくしてからもう一度お試しください`)), { status: 503, code: 'feature_disabled', feature: featureKey });
     }
 
